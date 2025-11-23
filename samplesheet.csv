@@ -1,0 +1,3 @@
+patient,sample,lane,fastq_1,fastq_2
+NA12878.1,NA12878.1,lane1,/home/vik/RSU_work/data/raw/test_snv/SRR1518158_1.fastq.gz,/home/vik/RSU_work/data/raw/test_snv/SRR1518158_2.fastq.gz
+NA12878.2,NA12878.2,lane1,/home/vik/RSU_work/data/raw/test_snv/SRR1518011_1.fastq.gz,/home/vik/RSU_work/data/raw/test_snv/SRR1518011_2.fastq.gz
