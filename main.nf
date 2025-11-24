@@ -8,11 +8,15 @@ nextflow.enable.dsl = 2
 include { BWA_INDEX                        } from './modules/nf-core/bwa/index/main'
 include { BWA_MEM                          } from './modules/nf-core/bwa/mem/main'
 include { PICARD_CREATESEQUENCEDICTIONARY } from './modules/nf-core/picard/createsequencedictionary/main'
-include { PICARD_MARKDUPLICATES           } from './modules/nf-core/picard/markduplicates/main'
+include { BIOBAMBAM_BAMMARKDUPLICATES2    } from './modules/nf-core/biobambam/bammarkduplicates2/main'
+include { SAMTOOLS_INDEX                  } from './modules/nf-core/samtools/index/main'
 
 
 /*
  * DOWNLOAD_REFERENCE
+ *
+ * - Download or reuse Homo_sapiens_assembly38.fasta
+ * - Output: [meta_ref, fasta]
  */
 process DOWNLOAD_REFERENCE {
 
@@ -45,12 +49,16 @@ process DOWNLOAD_REFERENCE {
 
 /*
  * SAMTOOLS_FAIDX_SIMPLE
+ *
+ * - Simple wrapper around `samtools faidx`
+ * - Input : [meta_ref, fasta]
+ * - Output: [meta_ref, fasta.fai]
  */
 process SAMTOOLS_FAIDX_SIMPLE {
 
     tag "${meta.id}"
     publishDir params.ref_dir, mode: 'copy'
-    container 'quay.io/biocontainers/samtools:1.3.1--h0cf4675_11'
+    container 'biocontainers/samtools:1.22.1--h96c455f_0'
 
     input:
     tuple val(meta), path(fasta)
@@ -68,6 +76,10 @@ process SAMTOOLS_FAIDX_SIMPLE {
 
 /*
  * ADD_READGROUPS
+ *
+ * - Add proper read groups to BAM using Picard
+ * - Input : [meta_sample, bam]
+ * - Output: [meta_sample, sample.rg.bam]
  */
 process ADD_READGROUPS {
 
@@ -104,8 +116,8 @@ process ADD_READGROUPS {
 /*
  * PICARDLIKE_DUPMETRICS
  *
- * Take Picard MarkDuplicates metrics and wrap them into a
- * Picard-like header + body file, as you described.
+ * Take biobambam2 metrics and wrap them into a Picard-like header
+ * so tools like MultiQC can treat them as Picard MarkDuplicates output.
  */
 process PICARDLIKE_DUPMETRICS {
 
@@ -114,7 +126,6 @@ process PICARDLIKE_DUPMETRICS {
     input:
     tuple val(meta), path(metrics)
 
-    // one output per metrics file
     output:
     tuple val(meta), path("*.duplicate_metrics_picard_like.txt")
 
@@ -128,7 +139,7 @@ process PICARDLIKE_DUPMETRICS {
     # Drop the first 3 lines and keep the tabular metrics
     tail -n +4 "\${in_metrics}" > tmp.txt
 
-    # Build a Picard-like header; adjust text as you like
+    # Build a Picard-like header
     cat <<EOF > header.txt
 ##htsjdk.samtools.metrics.StringHeader
 # MarkDuplicates INPUT=\${prefix}.bam OUTPUT=\${prefix}.bam METRICS_FILE=\${prefix}.duplication_metrics.txt ...
@@ -148,7 +159,7 @@ EOF
 workflow {
 
     /*
-     * 1) Reference
+     * 1) Reference preparation
      */
     def meta_ref = [ id: params.ref_id ]
 
@@ -156,18 +167,25 @@ workflow {
         | DOWNLOAD_REFERENCE
         | set { ref_ch }   // [meta_ref, fasta]
 
+    // Picard sequence dictionary
     PICARD_CREATESEQUENCEDICTIONARY(ref_ch)
+
+    // BWA index
     BWA_INDEX(ref_ch)
+
+    // samtools faidx
     SAMTOOLS_FAIDX_SIMPLE(ref_ch)
 
-    // Turn reference into VALUE channels
-    ref_ch.first().set                    { ref_val }    // [meta_ref, fasta]
-    BWA_INDEX.out.index.first().set       { index_val }  // [meta_ref, index_dir]
-    SAMTOOLS_FAIDX_SIMPLE.out.first().set { fai_val }    // [meta_ref, fasta.fai]
+    // Turn reference channels into singleton "value" channels for passing to modules
+    ref_ch.first().set                      { ref_val }      // [meta_ref, fasta]
+    BWA_INDEX.out.index.first().set         { index_val }    // [meta_ref, index_dir]
+    SAMTOOLS_FAIDX_SIMPLE.out.first().set   { fai_val }      // [meta_ref, fasta.fai] (not strictly needed later but good to have)
 
 
     /*
      * 2) Samples from samplesheet.csv
+     *
+     *    patient,sample,lane,fastq_1,fastq_2
      */
     Channel
         .fromPath(params.input, checkIfExists: true)
@@ -186,47 +204,63 @@ workflow {
 
 
     /*
-     * 3) BWA-MEM alignment (per sample)
+     * 3) BWA-MEM alignment (nf-core BWA_MEM)
+     *
+     *    BWA_MEM(
+     *      ch_reads,
+     *      index_val,    // BWA index dir
+     *      ref_val,      // FASTA
+     *      true          // sort_bam = true
+     *    )
+     *
+     *    This internally does: bwa mem ... | samtools sort ... -> sample.bam
      */
     BWA_MEM(
         ch_reads,
-        index_val,  // value
-        ref_val,    // value
+        index_val,
+        ref_val,
         true
     )
 
-    BWA_MEM.out.bam.set { ch_bam_raw }   // [meta_sample, bam]
+    BWA_MEM.out.bam.set { ch_bam_raw }   // [meta_sample, sample.bam]
 
 
     /*
-     * 4) Add read groups (per sample)
+     * 4) Add read groups with Picard (per sample)
      */
     ADD_READGROUPS(ch_bam_raw)
-    ADD_READGROUPS.out.set { ch_bam_rg }   // [meta_sample, bam_with_rg]
+    ADD_READGROUPS.out.set { ch_bam_rg }   // [meta_sample, sample.rg.bam]
 
 
     /*
-     * 5) Mark duplicates (per sample)
+     * 5) Remove / mark duplicates with biobambam2 (nf-core BIOBAMBAM_BAMMARKDUPLICATES2)
+     *
+     *    We change meta.id to "<sample>_rmdup" so we:
+     *      - don't overwrite the RG BAM
+     *      - have clear naming for deduplicated files
      */
     ch_bam_rg
         .map { meta, bam ->
             def new_meta = meta.clone()
-            new_meta.id = "${meta.id}.dedup"
+            new_meta.id = "${meta.id}_rmdup"
             tuple(new_meta, bam)
         }
-        .set { ch_bam_for_markdup }
+        .set { ch_bam_for_dedup }
 
-    PICARD_MARKDUPLICATES(
-        ch_bam_for_markdup,
-        ref_val,   // value
-        fai_val    // value
-    )
+    BIOBAMBAM_BAMMARKDUPLICATES2(ch_bam_for_dedup)
 
-    // Capture metrics output channel
-    PICARD_MARKDUPLICATES.out.metrics.set { ch_dup_metrics }
+    BIOBAMBAM_BAMMARKDUPLICATES2.out.bam.set     { ch_bam_dedup }     // [meta_rmdup, sample_rmdup.bam]
+    BIOBAMBAM_BAMMARKDUPLICATES2.out.metrics.set { ch_dup_metrics }   // [meta_rmdup, sample_rmdup.metrics.txt]
+
 
     /*
-     * 6) Picard-like duplication metrics (per sample)
+     * 6) Index deduplicated BAM with nf-core SAMTOOLS_INDEX
+     */
+    SAMTOOLS_INDEX(ch_bam_dedup)
+
+
+    /*
+     * 7) Picard-like duplication metrics formatting
      */
     PICARDLIKE_DUPMETRICS(ch_dup_metrics)
 }
