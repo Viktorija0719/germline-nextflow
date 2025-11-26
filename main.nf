@@ -10,13 +10,13 @@ include { BWA_MEM                          } from './modules/nf-core/bwa/mem/mai
 include { PICARD_CREATESEQUENCEDICTIONARY } from './modules/nf-core/picard/createsequencedictionary/main'
 include { BIOBAMBAM_BAMMARKDUPLICATES2    } from './modules/nf-core/biobambam/bammarkduplicates2/main'
 include { SAMTOOLS_INDEX                  } from './modules/nf-core/samtools/index/main'
+include { FASTQC                          } from './modules/nf-core/fastqc/main'
+include { SAMTOOLS_IDXSTATS               } from './modules/nf-core/samtools/idxstats/main'
+include { VERIFYBAMID_VERIFYBAMID2        } from './modules/nf-core/verifybamid/verifybamid2/main'
 
 
 /*
  * DOWNLOAD_REFERENCE
- *
- * - Download or reuse Homo_sapiens_assembly38.fasta
- * - Output: [meta_ref, fasta]
  */
 process DOWNLOAD_REFERENCE {
 
@@ -49,16 +49,13 @@ process DOWNLOAD_REFERENCE {
 
 /*
  * SAMTOOLS_FAIDX_SIMPLE
- *
- * - Simple wrapper around `samtools faidx`
- * - Input : [meta_ref, fasta]
- * - Output: [meta_ref, fasta.fai]
+ * (simple faidx wrapper for the reference FASTA)
  */
 process SAMTOOLS_FAIDX_SIMPLE {
 
     tag "${meta.id}"
     publishDir params.ref_dir, mode: 'copy'
-    container 'biocontainers/samtools:1.22.1--h96c455f_0'
+    container 'quay.io/biocontainers/samtools:1.3.1--h0cf4675_11'
 
     input:
     tuple val(meta), path(fasta)
@@ -76,10 +73,6 @@ process SAMTOOLS_FAIDX_SIMPLE {
 
 /*
  * ADD_READGROUPS
- *
- * - Add proper read groups to BAM using Picard
- * - Input : [meta_sample, bam]
- * - Output: [meta_sample, sample.rg.bam]
  */
 process ADD_READGROUPS {
 
@@ -93,8 +86,8 @@ process ADD_READGROUPS {
 
     script:
     def rgid     = meta.id
-    def sample   = meta.sample ?: meta.id
-    def lib      = meta.library ?: meta.patient ?: meta.id
+    def sample   = meta.sample   ?: meta.id
+    def lib      = meta.library  ?: meta.patient ?: meta.id
     def platform = meta.platform ?: 'ILLUMINA'
     def pu       = meta.platform_unit ?: "${meta.id}.${meta.lane ?: 'L1'}"
 
@@ -115,9 +108,7 @@ process ADD_READGROUPS {
 
 /*
  * PICARDLIKE_DUPMETRICS
- *
- * Take biobambam2 metrics and wrap them into a Picard-like header
- * so tools like MultiQC can treat them as Picard MarkDuplicates output.
+ * Wrap biobambam2 metrics into Picard-like format for MultiQC.
  */
 process PICARDLIKE_DUPMETRICS {
 
@@ -159,7 +150,7 @@ EOF
 workflow {
 
     /*
-     * 1) Reference preparation
+     * 1) Reference
      */
     def meta_ref = [ id: params.ref_id ]
 
@@ -167,24 +158,18 @@ workflow {
         | DOWNLOAD_REFERENCE
         | set { ref_ch }   // [meta_ref, fasta]
 
-    // Picard sequence dictionary
     PICARD_CREATESEQUENCEDICTIONARY(ref_ch)
-
-    // BWA index
     BWA_INDEX(ref_ch)
-
-    // samtools faidx
     SAMTOOLS_FAIDX_SIMPLE(ref_ch)
 
-    // Turn reference channels into singleton "value" channels for passing to modules
-    ref_ch.first().set                      { ref_val }      // [meta_ref, fasta]
-    BWA_INDEX.out.index.first().set         { index_val }    // [meta_ref, index_dir]
-    SAMTOOLS_FAIDX_SIMPLE.out.first().set   { fai_val }      // [meta_ref, fasta.fai] (not strictly needed later but good to have)
+    // Turn reference into VALUE channels
+    ref_ch.first().set                    { ref_val }    // [meta_ref, fasta]
+    BWA_INDEX.out.index.first().set       { index_val }  // [meta_ref, bwa_dir]
+    SAMTOOLS_FAIDX_SIMPLE.out.first().set { fai_val }    // [meta_ref, fasta.fai]
 
 
     /*
      * 2) Samples from samplesheet.csv
-     *
      *    patient,sample,lane,fastq_1,fastq_2
      */
     Channel
@@ -204,199 +189,106 @@ workflow {
 
 
     /*
-     * 3) BWA-MEM alignment (nf-core BWA_MEM)
-     *
-     *    BWA_MEM(
-     *      ch_reads,
-     *      index_val,    // BWA index dir
-     *      ref_val,      // FASTA
-     *      true          // sort_bam = true
-     *    )
-     *
-     *    This internally does: bwa mem ... | samtools sort ... -> sample.bam
+     * 3) BWA-MEM alignment (sorted BAM)
+     *    nf-core BWA_MEM internally does: bwa mem | samtools sort
      */
     BWA_MEM(
         ch_reads,
-        index_val,
-        ref_val,
-        true
+        index_val,  // value channel
+        ref_val,    // value channel
+        true        // sort_bam = true
     )
 
-    BWA_MEM.out.bam.set { ch_bam_raw }   // [meta_sample, sample.bam]
+    BWA_MEM.out.bam.set { ch_bam_sorted }   // [meta_sample, sorted.bam]
 
 
     /*
-     * 4) Add read groups with Picard (per sample)
+     * 4) Add read groups
      */
-    ADD_READGROUPS(ch_bam_raw)
-    ADD_READGROUPS.out.set { ch_bam_rg }   // [meta_sample, sample.rg.bam]
+    ADD_READGROUPS(ch_bam_sorted)
+    ADD_READGROUPS.out.set { ch_bam_rg }    // [meta_sample, bam_with_rg]
 
 
     /*
-     * 5) Remove / mark duplicates with biobambam2 (nf-core BIOBAMBAM_BAMMARKDUPLICATES2)
-     *
-     *    We change meta.id to "<sample>_rmdup" so we:
-     *      - don't overwrite the RG BAM
-     *      - have clear naming for deduplicated files
+     * 5) Mark duplicates (biobambam2, remove dups)
      */
     ch_bam_rg
         .map { meta, bam ->
             def new_meta = meta.clone()
-            new_meta.id = "${meta.id}_rmdup"
+            new_meta.id = "${meta.id}_rmdup"  // prefix for final BAM
             tuple(new_meta, bam)
         }
-        .set { ch_bam_for_dedup }
+        .set { ch_bam_for_markdup }
 
-    BIOBAMBAM_BAMMARKDUPLICATES2(ch_bam_for_dedup)
+    BIOBAMBAM_BAMMARKDUPLICATES2(ch_bam_for_markdup)
 
-    BIOBAMBAM_BAMMARKDUPLICATES2.out.bam.set     { ch_bam_dedup }     // [meta_rmdup, sample_rmdup.bam]
-    BIOBAMBAM_BAMMARKDUPLICATES2.out.metrics.set { ch_dup_metrics }   // [meta_rmdup, sample_rmdup.metrics.txt]
+    BIOBAMBAM_BAMMARKDUPLICATES2.out.bam.set     { ch_bam_dedup }     // [meta_dedup, dedup.bam]
+    BIOBAMBAM_BAMMARKDUPLICATES2.out.metrics.set { ch_dup_metrics }   // [meta_dedup, *.metrics.txt]
 
 
     /*
-     * 6) Index deduplicated BAM with nf-core SAMTOOLS_INDEX
+     * 6) Index final BAMs
      */
     SAMTOOLS_INDEX(ch_bam_dedup)
+    SAMTOOLS_INDEX.out.bai.set { ch_bai }   // [meta_dedup, *.bai]
 
 
     /*
-     * 7) Picard-like duplication metrics formatting
+     * 7) Picard-like duplication metrics (for MultiQC)
      */
     PICARDLIKE_DUPMETRICS(ch_dup_metrics)
+
+
+    /*
+     * 8a) BAM-level FastQC on deduplicated BAMs
+     */
+    FASTQC(ch_bam_dedup)
+
+
+    /*
+     * 8b) samtools idxstats (BAM + BAI)
+     *     Build one shared BAM+BAI channel and fan it out.
+     */
+    ch_bam_dedup
+        .join(ch_bai)                       // [meta, bam, bai]
+        .set { ch_bam_bai }
+
+    SAMTOOLS_IDXSTATS(ch_bam_bai)
+
+
+    /*
+     * 9) VerifyBamID2 contamination estimates
+     *    Using precomputed SVD (UD / mu / bed) + reference FASTA.
+     *    No RefVCF (we pass a dummy placeholder file with unique name).
+     */
+
+    // 9.1 SVD triple as a value channel
+    Channel.value(
+        tuple(
+            file(params.verifybamid2_ud),
+            file(params.verifybamid2_mu),
+            file(params.verifybamid2_bed)
+        )
+    ).set { ch_vbid_svd }
+
+    // 9.2 Dummy "refvcf" path that is NOT a .vcf and not one of UD/MU/BED
+    Channel.value(
+        file(params.verifybamid2_dummy_refvcf)
+    ).set { ch_vbid_refvcf }
+
+    // 9.3 Reference FASTA path as value channel
+    ref_val
+        .map { meta, fasta -> fasta }
+        .set { ch_vbid_ref }
+
+    // 9.4 Use BAM+BAI channel directly (no dummy BAI → no file name collision)
+    VERIFYBAMID_VERIFYBAMID2(
+        ch_bam_bai,     // (meta, bam, bai)
+        ch_vbid_svd,    // (UD, mu, bed)
+        ch_vbid_refvcf, // dummy refvcf (no --RefVCF)
+        ch_vbid_ref     // reference FASTA
+    )
+
+    // Capture selfSM (FREEMIX etc.)
+    VERIFYBAMID_VERIFYBAMID2.out.self_sm.set { ch_verifybamid_selfSM }
 }
-
-
-
-// workflow {
-
-//     // meta info for this reference
-//     def meta_ref = [ id: params.ref_id ]
-
-//     /*
-//      * 1) Download or reuse the FASTA
-//      */
-//     Channel.of( [ meta_ref, params.ref_url ] )
-//         | DOWNLOAD_REFERENCE
-//         | set { ref_ch }        // tuple: [meta_ref, fasta]
-
-
-//     /*
-//      * 2) Reference indexes
-//      *
-//      * SAMTOOLS_FAIDX needs:
-//      *   - fasta channel        : ref_ch
-//      *   - existing .fai file   : empty (none yet)
-//      *   - get_sizes flag       : false (no *.sizes file)
-//      */
-//     def fai_existing_ch = Channel.empty()
-//     def get_sizes_ch    = Channel.of(false)
-
-//     SAMTOOLS_FAIDX(ref_ch, fai_existing_ch, get_sizes_ch)
-
-//     // Keep named channels for reference FASTA + BWA index
-//     def ch_fasta = ref_ch
-
-//     BWA_INDEX(ch_fasta)
-//     def ch_index = BWA_INDEX.out.index
-
-//     // Picard sequence dictionary
-//     PICARD_CREATESEQUENCEDICTIONARY(ch_fasta)
-
-
-//     /*
-//      * 3) Build a channel with reads from the samplesheet
-//      *
-//      * samplesheet.csv:
-//      *   patient,sample,lane,fastq_1,fastq_2
-//      *
-//      * Channel structure:
-//      *   [ meta_sample, [fastq1, fastq2] ]
-//      */
-//     Channel
-//         .fromPath(params.input, checkIfExists: true)
-//         .splitCsv(header: true)
-//         .map { row ->
-//             def meta_sample = [
-//                 id         : row.sample,
-//                 sample     : row.sample,
-//                 patient    : row.patient,
-//                 lane       : row.lane,
-//                 single_end : false
-//             ]
-//             tuple(meta_sample, [ file(row.fastq_1), file(row.fastq_2) ])
-//         }
-//         .set { ch_samples }
-
-
-//     /*
-//      * 4) Alignment with BWA_MEM (nf-core module)
-//      *
-//      * BWA_MEM(
-//      *   ch_samples : [meta_sample, reads]
-//      *   ch_index   : [meta_ref, bwa_index_dir]
-//      *   ch_fasta   : [meta_ref, fasta]
-//      *   true       : sort_bam -> samtools sort in-module
-//      * )
-//      */
-//     BWA_MEM(
-//         ch_samples,
-//         ch_index,
-//         ch_fasta,
-//         true       // sort_bam
-//     )
-
-//     // BAMs from BWA_MEM (one per sample)
-//     def ch_bam = BWA_MEM.out.bam
-
-
-//     /*
-//      * 5) Mark duplicates with Picard MarkDuplicates (nf-core module)
-//      *
-//      * Input:  [meta_sample, bam]
-//      * Output: bam (dedup), metrics, optional bai
-//      * (CREATE_INDEX=true is set in nextflow.config)
-//      */
-//     PICARD_MARKDUPLICATES(ch_bam, ref_ch, SAMTOOLS_FAIDX.out.fai)
-
-//     def ch_dedup_bam     = PICARD_MARKDUPLICATES.out.bam
-//     def ch_dedup_metrics = PICARD_MARKDUPLICATES.out.metrics
-
-//     // At this point you have:
-//     //  - reference prepared (FASTA, FAI, dict, BWA index)
-//     //  - per-sample deduplicated BAMs + metrics
-//     // Next steps: add variant calling modules (bcftools / GATK etc.)
-// }
-
-
-// workflow {
-
-//     // meta info for this reference
-//     def meta = [ id: params.ref_id ]
-
-//     /*
-//      * 1) Download or reuse the FASTA
-//      */
-//     Channel.of( [ meta, params.ref_url ] )
-//         | DOWNLOAD_REFERENCE
-//         | set { ref_ch }        // tuple: [meta, fasta]
-
-//     /*
-//      * 2) Prepare channels required by SAMTOOLS_FAIDX
-//      *
-//      *    - fa_ch       : our ref_ch (meta + fasta)
-//      *    - fai_ch      : empty for now (no pre-existing .fai to reuse)
-//      *    - get_sizes_ch: boolean; false = don't emit *.sizes file
-//      */
-//     def fai_existing_ch = Channel.empty()
-//     def get_sizes_ch    = Channel.of(false)
-
-//     // This now matches the nf-core module signature: 3 input channels
-//     SAMTOOLS_FAIDX(ref_ch, fai_existing_ch, get_sizes_ch)
-
-//     /*
-//      * 3) Other indexing modules: these only expect a single channel
-//      *    containing [meta, fasta]
-//      */
-//     PICARD_CREATESEQUENCEDICTIONARY(ref_ch)
-//     BWA_INDEX(ref_ch)
-// }
