@@ -13,6 +13,7 @@ include { SAMTOOLS_INDEX                  } from './modules/nf-core/samtools/ind
 include { FASTQC                          } from './modules/nf-core/fastqc/main'
 include { SAMTOOLS_IDXSTATS               } from './modules/nf-core/samtools/idxstats/main'
 include { VERIFYBAMID_VERIFYBAMID2        } from './modules/nf-core/verifybamid/verifybamid2/main'
+include { QUALIMAP_BAMQC                  } from './modules/nf-core/qualimap/bamqc/main'
 
 
 /*
@@ -67,6 +68,30 @@ process SAMTOOLS_FAIDX_SIMPLE {
     """
     set -euo pipefail
     samtools faidx ${fasta}
+    """
+}
+
+
+/*
+ * MAKE_GENOME_BED
+ * Build a simple whole-genome BED from the FASTA index (.fai)
+ * One line per contig: chrom, 0, length
+ */
+process MAKE_GENOME_BED {
+
+    tag "${meta.id}"
+    publishDir params.ref_dir, mode: 'copy'
+
+    input:
+    tuple val(meta), path(fai)
+
+    output:
+    tuple val(meta), path("genome.autobed")
+
+    script:
+    """
+    set -euo pipefail
+    awk 'BEGIN{OFS="\\t"} {print \$1,0,\$2}' ${fai} > genome.autobed
     """
 }
 
@@ -167,6 +192,20 @@ workflow {
     BWA_INDEX.out.index.first().set       { index_val }  // [meta_ref, bwa_dir]
     SAMTOOLS_FAIDX_SIMPLE.out.first().set { fai_val }    // [meta_ref, fasta.fai]
 
+    /*
+     * 1b) Qualimap regions:
+     *     - If params.qualimap_bed is given -> use that file (e.g. WES targets)
+     *     - Else -> auto-generate a whole-genome BED from the .fai
+     */
+    def ch_qualimap_regions
+
+    if ( params.qualimap_bed ) {
+        ch_qualimap_regions = Channel.value( file(params.qualimap_bed) )
+    } else {
+        MAKE_GENOME_BED(fai_val)
+        ch_qualimap_regions = MAKE_GENOME_BED.out.map { meta, bed -> bed }
+    }
+
 
     /*
      * 2) Samples from samplesheet.csv
@@ -247,7 +286,6 @@ workflow {
 
     /*
      * 8b) samtools idxstats (BAM + BAI)
-     *     Build one shared BAM+BAI channel and fan it out.
      */
     ch_bam_dedup
         .join(ch_bai)                       // [meta, bam, bai]
@@ -259,7 +297,7 @@ workflow {
     /*
      * 9) VerifyBamID2 contamination estimates
      *    Using precomputed SVD (UD / mu / bed) + reference FASTA.
-     *    No RefVCF (we pass a dummy placeholder file with unique name).
+     *    No RefVCF (dummy placeholder).
      */
 
     // 9.1 SVD triple as a value channel
@@ -271,7 +309,7 @@ workflow {
         )
     ).set { ch_vbid_svd }
 
-    // 9.2 Dummy "refvcf" path that is NOT a .vcf and not one of UD/MU/BED
+    // 9.2 Dummy "refvcf" path that is NOT a .vcf
     Channel.value(
         file(params.verifybamid2_dummy_refvcf)
     ).set { ch_vbid_refvcf }
@@ -281,7 +319,7 @@ workflow {
         .map { meta, fasta -> fasta }
         .set { ch_vbid_ref }
 
-    // 9.4 Use BAM+BAI channel directly (no dummy BAI → no file name collision)
+    // 9.4 Use BAM+BAI channel directly
     VERIFYBAMID_VERIFYBAMID2(
         ch_bam_bai,     // (meta, bam, bai)
         ch_vbid_svd,    // (UD, mu, bed)
@@ -291,4 +329,17 @@ workflow {
 
     // Capture selfSM (FREEMIX etc.)
     VERIFYBAMID_VERIFYBAMID2.out.self_sm.set { ch_verifybamid_selfSM }
+
+
+    /*
+     * 10) Qualimap2 (bamqc)
+     *     - If WGS: uses auto-generated genome.autobed
+     *     - If WES/targeted: uses params.qualimap_bed (BED)
+     */
+    QUALIMAP_BAMQC(
+        ch_bam_dedup,       // (meta, bam)
+        ch_qualimap_regions // single value channel with BED / regions file
+    )
+
+    QUALIMAP_BAMQC.out.results.set { ch_qualimap_results }
 }
