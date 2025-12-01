@@ -14,6 +14,7 @@ include { FASTQC                          } from './modules/nf-core/fastqc/main'
 include { SAMTOOLS_IDXSTATS               } from './modules/nf-core/samtools/idxstats/main'
 include { VERIFYBAMID_VERIFYBAMID2        } from './modules/nf-core/verifybamid/verifybamid2/main'
 include { QUALIMAP_BAMQC                  } from './modules/nf-core/qualimap/bamqc/main'
+include { GATK_DEPTHOFCOVERAGE            } from './modules/local/gatk/depthofcoverage/main'
 
 
 /*
@@ -174,7 +175,8 @@ EOF
  */
 workflow {
 
-    /*
+
+        /*
      * 1) Reference
      */
     def meta_ref = [ id: params.ref_id ]
@@ -191,6 +193,21 @@ workflow {
     ref_ch.first().set                    { ref_val }    // [meta_ref, fasta]
     BWA_INDEX.out.index.first().set       { index_val }  // [meta_ref, bwa_dir]
     SAMTOOLS_FAIDX_SIMPLE.out.first().set { fai_val }    // [meta_ref, fasta.fai]
+
+    // For DepthOfCoverage: just the FAI path (no meta)
+    fai_val
+        .map { meta, fai -> fai }
+        .set { ch_doc_fai }
+
+
+
+    // For DepthOfCoverage: the .dict path from Picard
+    PICARD_CREATESEQUENCEDICTIONARY.out.reference_dict
+        .first()
+        .map { meta, dict -> dict }
+        .set { ch_doc_dict }
+    
+
 
     /*
      * 1b) Qualimap regions:
@@ -342,4 +359,52 @@ workflow {
     )
 
     QUALIMAP_BAMQC.out.results.set { ch_qualimap_results }
+
+
+    /*
+     * 11) GATK DepthOfCoverage (local module, GATK4)
+     *     Using deduplicated BAM + BAI, reference FASTA/FAI/DICT, BED, gene list.
+     */
+
+    // Reference FASTA as value channel (just the path, not meta)
+    ref_val
+        .map { meta, fasta -> fasta }
+        .set { ch_doc_ref }
+
+    // ch_doc_fai and ch_doc_dict are defined above from fai_val and PICARD output
+
+
+    // BED for coverage: prefer dedicated GATK BED, otherwise reuse qualimap_bed
+    def bed_path = params.gatk_target_bed ?: params.qualimap_bed
+    if( !bed_path ) {
+        MAKE_GENOME_BED(fai_val)
+        MAKE_GENOME_BED.out
+            .first()                   // convert to value channel
+            .map { meta, bed -> bed }
+            .set { ch_doc_bed }
+    } else {
+        Channel.value( file(bed_path) ) // <-- value channel, broadcasts to all samples
+            .set { ch_doc_bed }
+    }
+
+    // Gene list for DepthOfCoverage (e.g. refGene.hg38.txt)
+    Channel.value( file(params.gatk_gene_list) ) // <-- value channel
+        .set { ch_doc_gene_list }
+
+
+    // Finally call the module
+    GATK_DEPTHOFCOVERAGE(
+        ch_bam_bai,      // (meta, bam, bai)
+        ch_doc_ref,      // FASTA
+        ch_doc_fai,      // FASTA.fai
+        ch_doc_dict,     // FASTA.dict
+        ch_doc_bed,      // BED
+        ch_doc_gene_list // gene list
+    )
+    
+
+    GATK_DEPTHOFCOVERAGE.out.coverage.set { ch_doc_coverage }
+
+
+
 }

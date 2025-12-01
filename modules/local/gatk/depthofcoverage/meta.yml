@@ -1,0 +1,60 @@
+name: gatk_depthofcoverage
+description: Calculate depth of coverage per gene/interval using GATK3 DepthOfCoverage
+keywords:
+  - coverage
+  - exome
+  - WES
+  - XHMM
+  - QC
+tools:
+  - gatk:
+      description: Genome Analysis Toolkit (GATK3) from the Broad Institute
+      homepage: https://gatk.broadinstitute.org/
+      documentation: https://gatk.broadinstitute.org/hc/en-us/articles/360036883571-DepthOfCoverage
+      licence: ["BSD-3-Clause"]
+input:
+  - - meta:
+        type: map
+        description: |
+          Groovy Map containing sample information
+          e.g. [ id:'test', single_end:false ]
+    - bam:
+        type: file
+        description: Deduplicated BAM file
+        pattern: "*.{bam}"
+    - bai:
+        type: file
+        description: BAM index
+        pattern: "*.bai"
+  - - ref_fasta:
+        type: file
+        description: Reference genome FASTA
+        pattern: "*.{fa,fasta}"
+    - target_bed:
+        type: file
+        description: Target regions BED file (e.g. exomes, capture targets)
+        pattern: "*.bed"
+    - gene_list:
+        type: file
+        description: Gene list for --calculate_coverage_over_genes
+        pattern: "*.txt"
+output:
+  coverage:
+    - - meta:
+          type: map
+          description: >
+            Groovy Map containing sample information.
+      - "*.DepthOfCoverage.*":
+          type: file
+          description: |
+            DepthOfCoverage output files (gene_summary, sample_summary, etc.).
+          pattern: "*.DepthOfCoverage.*"
+  versions:
+    - versions.yml:
+        type: file
+        description: File containing software versions
+        pattern: "versions.yml"
+authors:
+  - "@Viktorija0719"
+maintainers:
+  - "@Viktorija0719"
