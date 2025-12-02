@@ -15,6 +15,8 @@ include { SAMTOOLS_IDXSTATS               } from './modules/nf-core/samtools/idx
 include { VERIFYBAMID_VERIFYBAMID2        } from './modules/nf-core/verifybamid/verifybamid2/main'
 include { QUALIMAP_BAMQC                  } from './modules/nf-core/qualimap/bamqc/main'
 include { GATK_DEPTHOFCOVERAGE            } from './modules/local/gatk/depthofcoverage/main'
+include { DEEPVARIANT_RUNDEEPVARIANT } from './modules/nf-core/deepvariant/rundeepvariant/main'
+
 
 
 /*
@@ -404,6 +406,56 @@ workflow {
     
 
     GATK_DEPTHOFCOVERAGE.out.coverage.set { ch_doc_coverage }
+
+
+
+    /*
+     * 12) DeepVariant (variant calling)
+     *     Uses final deduplicated BAM + BAI, reference FASTA/FAI, target regions BED,
+     *     dummy GZI and dummy PAR BED.
+     */
+
+    // 12.1 Target regions: use params.target_regions_bed by default
+    Channel.fromPath(params.target_regions_bed, checkIfExists: true)
+           .set { ch_target_regions_bed }   // value channel with a single BED file
+
+    // 12.2 Combine BAM+BAI with target intervals -> (meta, bam, bai, intervals)
+    ch_bam_bai
+        .combine(ch_target_regions_bed)
+        .map { meta, bam, bai, intervals ->
+            tuple(meta, bam, bai, intervals)
+        }
+        .set { ch_deep_bam }
+
+    // 12.3 Reference FASTA and FAI as-is
+    def ch_deep_fasta = ref_val   // (meta_ref, fasta)
+    def ch_deep_fai   = fai_val   // (meta_ref, fasta.fai)
+
+    // 12.4 Dummy GZI: must be a *different* filename than the .fai
+    Channel.value(
+        tuple( [ id: params.ref_id ], file(params.deepvariant_gzi_dummy) )
+    ).set { ch_deep_gzi }   // (meta_ref, dummy_fasta.gzi)
+
+    // 12.5 Dummy PAR BED (empty file, no effect)
+    Channel.value(
+        tuple( [ id: params.ref_id ], file(params.par_regions_bed) )
+    ).set { ch_deep_par }   // (meta_ref, empty_par_regions.bed)
+
+    // 12.6 Run DeepVariant with all 5 required input tuples
+    DEEPVARIANT_RUNDEEPVARIANT(
+        ch_deep_bam,    // (meta, bam, bai, intervals)
+        ch_deep_fasta,  // (meta_ref, fasta)
+        ch_deep_fai,    // (meta_ref, fasta.fai)
+        ch_deep_gzi,    // (meta_ref, dummy_fasta.gzi)
+        ch_deep_par     // (meta_ref, empty_par_regions.bed)
+    )
+
+    // 12.7 Capture outputs
+    DEEPVARIANT_RUNDEEPVARIANT.out.vcf        .set { ch_deep_vcf }
+    DEEPVARIANT_RUNDEEPVARIANT.out.vcf_index  .set { ch_deep_vcf_index }
+    DEEPVARIANT_RUNDEEPVARIANT.out.gvcf       .set { ch_deep_gvcf }
+    DEEPVARIANT_RUNDEEPVARIANT.out.gvcf_index .set { ch_deep_gvcf_index }
+
 
 
 
