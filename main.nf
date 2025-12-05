@@ -16,6 +16,10 @@ include { VERIFYBAMID_VERIFYBAMID2        } from './modules/nf-core/verifybamid/
 include { QUALIMAP_BAMQC                  } from './modules/nf-core/qualimap/bamqc/main'
 include { GATK_DEPTHOFCOVERAGE            } from './modules/local/gatk/depthofcoverage/main'
 include { DEEPVARIANT_RUNDEEPVARIANT } from './modules/nf-core/deepvariant/rundeepvariant/main'
+include { STRELKA_GERMLINE } from './modules/nf-core/strelka/germline/main'
+include { TABIX_TABIX      } from './modules/nf-core/tabix/tabix/main'
+include { STRELKA_CHRM_FILTER } from './modules/local/strelka/chrm_filter/main'
+
 
 
 
@@ -170,6 +174,29 @@ EOF
     rm tmp.txt header.txt
     """
 }
+
+
+
+/*
+ * BGZIP_BED
+ * Compress a BED file to BED.GZ (needed for tabix indexing)
+ */
+process BGZIP_BED {
+
+    tag "bgzip_bed"
+    container 'community.wave.seqera.io/library/htslib:1.21--ff8e28a189fbecaa'
+
+    input:
+    path bed
+
+    output:
+    path "*.bed.gz"
+
+    """
+    bgzip -c ${bed} > \$(basename ${bed}).gz
+    """
+}
+
 
 
 /*
@@ -455,6 +482,78 @@ workflow {
     DEEPVARIANT_RUNDEEPVARIANT.out.vcf_index  .set { ch_deep_vcf_index }
     DEEPVARIANT_RUNDEEPVARIANT.out.gvcf       .set { ch_deep_gvcf }
     DEEPVARIANT_RUNDEEPVARIANT.out.gvcf_index .set { ch_deep_gvcf_index }
+
+
+
+
+    /*
+     * 12b) Prepare compressed BED + tabix index for Strelka
+     *      Starting from the plain target BED (params.target_regions_bed)
+     */
+
+    // Plain BED as a value channel
+    Channel.value( file(params.target_regions_bed) )
+        .set { ch_strelka_bed_plain }
+
+    // Compress BED -> *.bed.gz
+    BGZIP_BED(ch_strelka_bed_plain)
+    BGZIP_BED.out.set { ch_strelka_bed_gz }   // path to .bed.gz
+
+    // Index compressed BED with tabix
+    ch_strelka_bed_gz
+        .map { bedgz -> tuple( [ id: 'strelka_bed' ], bedgz ) }
+        .set { ch_strelka_bed_for_tabix }
+
+    TABIX_TABIX(ch_strelka_bed_for_tabix)
+
+    TABIX_TABIX.out.index
+        .map { meta, idx -> idx }
+        .set { ch_strelka_bed_index }         // path to .bed.gz.tbi
+
+
+
+
+    /*
+     * 13) Strelka2 germline (alternative variant caller)
+     */
+
+    // STRELKA_GERMLINE expects:
+    // tuple(meta, bam, bai, target_bed, target_bed_index), fasta, fai
+    ch_bam_bai
+        .combine(ch_strelka_bed_gz)
+        .combine(ch_strelka_bed_index)
+        .map { meta, bam, bai, bedgz, bedidx ->
+            tuple(meta, bam, bai, bedgz, bedidx)
+        }
+        .set { ch_strelka_input }
+
+    STRELKA_GERMLINE(
+        ch_strelka_input,
+        ch_doc_ref,   // FASTA
+        ch_doc_fai    // FASTA.fai
+    )
+
+    // Capture outputs
+    STRELKA_GERMLINE.out.vcf            .set { ch_strelka_variants_vcf }
+    STRELKA_GERMLINE.out.vcf_tbi        .set { ch_strelka_variants_vcf_tbi }
+    STRELKA_GERMLINE.out.genome_vcf     .set { ch_strelka_genome_vcf }
+    STRELKA_GERMLINE.out.genome_vcf_tbi .set { ch_strelka_genome_vcf_tbi }
+
+    /*
+     * Strelka2 chrM / haploid filtering + PASS-only
+     */
+
+    // Pair variants VCF with its index
+    ch_strelka_variants_vcf
+        .join(ch_strelka_variants_vcf_tbi)   // (meta, vcf, tbi)
+        .set { ch_strelka_variants_with_index }
+
+    // Run local filter module
+    STRELKA_CHRM_FILTER(ch_strelka_variants_with_index)
+
+    // Capture filtered outputs
+    STRELKA_CHRM_FILTER.out.vcf.set { ch_strelka_filtered_vcf }
+    STRELKA_CHRM_FILTER.out.tbi.set { ch_strelka_filtered_vcf_tbi }
 
 
 
