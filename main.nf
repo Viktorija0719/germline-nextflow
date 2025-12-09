@@ -19,7 +19,9 @@ include { DEEPVARIANT_RUNDEEPVARIANT } from './modules/nf-core/deepvariant/runde
 include { STRELKA_GERMLINE } from './modules/nf-core/strelka/germline/main'
 include { TABIX_TABIX      } from './modules/nf-core/tabix/tabix/main'
 include { STRELKA_CHRM_FILTER } from './modules/local/strelka/chrm_filter/main'
-
+include { BCFTOOLS_CONCAT as BCFTOOLS_CONCAT_VCF      } from './modules/nf-core/bcftools/concat'
+include { BCFTOOLS_NORM  as BCFTOOLS_NORM_COMBINED   } from './modules/nf-core/bcftools/norm'
+include { BCFTOOLS_NORM  as BCFTOOLS_NORM_DVONLY     } from './modules/nf-core/bcftools/norm'
 
 
 
@@ -439,12 +441,12 @@ workflow {
     /*
      * 12) DeepVariant (variant calling)
      *     Uses final deduplicated BAM + BAI, reference FASTA/FAI, target regions BED,
-     *     dummy GZI and dummy PAR BED.
+     *     dummy GZI and PAR BED.
      */
 
-    // 12.1 Target regions: use params.target_regions_bed by default
-    Channel.fromPath(params.target_regions_bed, checkIfExists: true)
-           .set { ch_target_regions_bed }   // value channel with a single BED file
+    // 12.1 Target regions for DeepVariant: use params.target_regions_bed
+    Channel.value( file(params.target_regions_bed) )
+        .set { ch_target_regions_bed }
 
     // 12.2 Combine BAM+BAI with target intervals -> (meta, bam, bai, intervals)
     ch_bam_bai
@@ -454,19 +456,19 @@ workflow {
         }
         .set { ch_deep_bam }
 
-    // 12.3 Reference FASTA and FAI as-is
+    // 12.3 Reference FASTA and FAI as value channels
     def ch_deep_fasta = ref_val   // (meta_ref, fasta)
     def ch_deep_fai   = fai_val   // (meta_ref, fasta.fai)
 
-    // 12.4 Dummy GZI: must be a *different* filename than the .fai
+    // 12.4 Dummy GZI for DeepVariant (must NOT be the .fai file)
     Channel.value(
         tuple( [ id: params.ref_id ], file(params.deepvariant_gzi_dummy) )
     ).set { ch_deep_gzi }   // (meta_ref, dummy_fasta.gzi)
 
-    // 12.5 Dummy PAR BED (empty file, no effect)
+    // 12.5 PAR BED (can be empty, no effect if empty)
     Channel.value(
         tuple( [ id: params.ref_id ], file(params.par_regions_bed) )
-    ).set { ch_deep_par }   // (meta_ref, empty_par_regions.bed)
+    ).set { ch_deep_par }   // (meta_ref, par_regions.bed)
 
     // 12.6 Run DeepVariant with all 5 required input tuples
     DEEPVARIANT_RUNDEEPVARIANT(
@@ -474,15 +476,17 @@ workflow {
         ch_deep_fasta,  // (meta_ref, fasta)
         ch_deep_fai,    // (meta_ref, fasta.fai)
         ch_deep_gzi,    // (meta_ref, dummy_fasta.gzi)
-        ch_deep_par     // (meta_ref, empty_par_regions.bed)
+        ch_deep_par     // (meta_ref, par_regions.bed)
     )
 
-    // 12.7 Capture outputs
-    DEEPVARIANT_RUNDEEPVARIANT.out.vcf        .set { ch_deep_vcf }
-    DEEPVARIANT_RUNDEEPVARIANT.out.vcf_index  .set { ch_deep_vcf_index }
-    DEEPVARIANT_RUNDEEPVARIANT.out.gvcf       .set { ch_deep_gvcf }
-    DEEPVARIANT_RUNDEEPVARIANT.out.gvcf_index .set { ch_deep_gvcf_index }
+    // 12.7 Capture DeepVariant outputs
+    DEEPVARIANT_RUNDEEPVARIANT.out.vcf       .set { ch_dv_vcf_raw }   // (meta, vcf)
+    DEEPVARIANT_RUNDEEPVARIANT.out.vcf_index .set { ch_dv_vcf_tbi }   // (meta, tbi)
+    DEEPVARIANT_RUNDEEPVARIANT.out.gvcf      .set { ch_dv_gvcf }
+    DEEPVARIANT_RUNDEEPVARIANT.out.gvcf_index.set { ch_dv_gvcf_index }
 
+    // Join DV VCF + index -> (meta, vcf, tbi)
+    def ch_dv_vcf = ch_dv_vcf_raw.join(ch_dv_vcf_tbi)
 
 
 
@@ -491,7 +495,7 @@ workflow {
      *      Starting from the plain target BED (params.target_regions_bed)
      */
 
-    // Plain BED as a value channel
+    // Plain BED as a value channel for Strelka
     Channel.value( file(params.target_regions_bed) )
         .set { ch_strelka_bed_plain }
 
@@ -499,7 +503,7 @@ workflow {
     BGZIP_BED(ch_strelka_bed_plain)
     BGZIP_BED.out.set { ch_strelka_bed_gz }   // path to .bed.gz
 
-    // Index compressed BED with tabix
+    // Index compressed BED with tabix (module expects (meta, bedgz))
     ch_strelka_bed_gz
         .map { bedgz -> tuple( [ id: 'strelka_bed' ], bedgz ) }
         .set { ch_strelka_bed_for_tabix }
@@ -509,7 +513,6 @@ workflow {
     TABIX_TABIX.out.index
         .map { meta, idx -> idx }
         .set { ch_strelka_bed_index }         // path to .bed.gz.tbi
-
 
 
 
@@ -529,32 +532,93 @@ workflow {
 
     STRELKA_GERMLINE(
         ch_strelka_input,
-        ch_doc_ref,   // FASTA
-        ch_doc_fai    // FASTA.fai
+        ch_doc_ref,   // FASTA (path-only channel; matches module API)
+        ch_doc_fai    // FASTA.fai (path-only channel)
     )
 
-    // Capture outputs
-    STRELKA_GERMLINE.out.vcf            .set { ch_strelka_variants_vcf }
-    STRELKA_GERMLINE.out.vcf_tbi        .set { ch_strelka_variants_vcf_tbi }
+    // Capture Strelka outputs
+    STRELKA_GERMLINE.out.vcf            .set { ch_strelka_variants_vcf }      // (meta, vcf)
+    STRELKA_GERMLINE.out.vcf_tbi        .set { ch_strelka_variants_vcf_tbi }  // (meta, tbi)
     STRELKA_GERMLINE.out.genome_vcf     .set { ch_strelka_genome_vcf }
     STRELKA_GERMLINE.out.genome_vcf_tbi .set { ch_strelka_genome_vcf_tbi }
+
+
 
     /*
      * Strelka2 chrM / haploid filtering + PASS-only
      */
 
-    // Pair variants VCF with its index
+    // Pair variants VCF with its index -> (meta, vcf, tbi)
     ch_strelka_variants_vcf
-        .join(ch_strelka_variants_vcf_tbi)   // (meta, vcf, tbi)
+        .join(ch_strelka_variants_vcf_tbi)
         .set { ch_strelka_variants_with_index }
 
     // Run local filter module
     STRELKA_CHRM_FILTER(ch_strelka_variants_with_index)
 
     // Capture filtered outputs
-    STRELKA_CHRM_FILTER.out.vcf.set { ch_strelka_filtered_vcf }
-    STRELKA_CHRM_FILTER.out.tbi.set { ch_strelka_filtered_vcf_tbi }
+    STRELKA_CHRM_FILTER.out.vcf.set { ch_st2_vcf_raw }   // (meta, vcf)
+    STRELKA_CHRM_FILTER.out.tbi.set { ch_st2_vcf_tbi }   // (meta, tbi)
 
+    // Join filtered Strelka VCF + index -> (meta, vcf, tbi)
+    def ch_st2_vcf = ch_st2_vcf_raw.join(ch_st2_vcf_tbi)
+
+
+
+    /*
+     * 14) bcftools concat DeepVariant + Strelka2
+     */
+
+    // Join DeepVariant and Strelka2 on meta.id
+    def ch_concat_input = ch_dv_vcf
+        .join(ch_st2_vcf)
+        .map { meta, dv_vcf, dv_tbi, st_vcf, st_tbi ->
+            def m = meta.clone()
+            m.id = "${meta.id}.DV_ST2.comb"  // will appear in filenames
+
+            def vcfs = [ dv_vcf, st_vcf ]
+            def tbis = [ dv_tbi, st_tbi ]
+            tuple(m, vcfs, tbis)             // matches: tuple val(meta), path(vcfs), path(tbi)
+        }
+
+    // bcftools concat; bcftools options are in nextflow.config (ext.args)
+    BCFTOOLS_CONCAT_VCF(ch_concat_input)
+
+    // Join concat VCF + index -> (meta, vcf, tbi)
+    def ch_concat_vcf = BCFTOOLS_CONCAT_VCF.out.vcf
+        .join(BCFTOOLS_CONCAT_VCF.out.tbi)
+
+    // Build input for bcftools norm on combined calls
+    def ch_norm_input_vcf = ch_concat_vcf
+        .map { meta, vcf, tbi ->
+            def m = meta.clone()
+            m.id = "${meta.id}.DV_ST2.comb.norm"
+            tuple(m, vcf, tbi)
+        }
+
+
+
+    /*
+     * 15) bcftools norm on:
+     *     a) combined DV+Strelka VCF
+     *     b) DeepVariant-only VCF
+     */
+
+    // Reference FASTA for bcftools norm (tuple (meta_ref, fasta))
+    def ch_ref_fasta = ref_val
+
+    // (a) Run bcftools norm on combined DV+Strelka VCF
+    BCFTOOLS_NORM_COMBINED(ch_norm_input_vcf, ch_ref_fasta)
+
+    // (b) DeepVariant-only normalization
+    def ch_dv_norm_input = ch_dv_vcf
+        .map { meta, vcf, tbi ->
+            def m = meta.clone()
+            m.id = "${meta.id}.DV_only.norm"
+            tuple(m, vcf, tbi)
+        }
+
+    BCFTOOLS_NORM_DVONLY(ch_dv_norm_input, ch_ref_fasta)
 
 
 
