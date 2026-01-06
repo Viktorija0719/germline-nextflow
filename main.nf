@@ -22,39 +22,22 @@ include { STRELKA_CHRM_FILTER } from './modules/local/strelka/chrm_filter/main'
 include { BCFTOOLS_CONCAT as BCFTOOLS_CONCAT_VCF      } from './modules/nf-core/bcftools/concat'
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_COMBINED   } from './modules/nf-core/bcftools/norm'
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_DVONLY     } from './modules/nf-core/bcftools/norm'
+include { MANTA_GERMLINE } from './modules/nf-core/manta/germline/main'
 
 
 
-/*
- * DOWNLOAD_REFERENCE
- */
-process DOWNLOAD_REFERENCE {
 
-    tag "${meta.id}"
-    publishDir params.ref_dir, mode: 'copy'
-
-    input:
-    tuple val(meta), val(ref_url)
-
-    output:
-    tuple val(meta), path("${params.ref_name}.fasta")
-
-    script:
-    """
-    set -euo pipefail
-
-    mkdir -p "${params.ref_dir}"
-
-    if [ -s "${params.ref_dir}/${params.ref_name}.fasta" ]; then
-        echo ">>> Found existing FASTA in ${params.ref_dir}, reusing it."
-        ln -s "${params.ref_dir}/${params.ref_name}.fasta" "${params.ref_name}.fasta"
-    else
-        echo ">>> Downloading reference from: ${ref_url}"
-        wget -O "${params.ref_name}.fasta" "${ref_url}"
-        cp "${params.ref_name}.fasta" "${params.ref_dir}/"
-    fi
-    """
+def getGenomeAttr(String attr) {
+  if ( !params.genome ) return null
+  if ( !params.genomes || !params.genomes.containsKey(params.genome) )
+    error "Unknown --genome '${params.genome}'. Add it to conf/igenomes.config"
+  def g = params.genomes[params.genome]
+  if ( !g.containsKey(attr) )
+    error "Genome '${params.genome}' does not define '${attr}' in conf/igenomes.config"
+  return g[attr]
 }
+
+
 
 
 /*
@@ -64,7 +47,7 @@ process DOWNLOAD_REFERENCE {
 process SAMTOOLS_FAIDX_SIMPLE {
 
     tag "${meta.id}"
-    publishDir params.ref_dir, mode: 'copy'
+    publishDir "${params.outdir}/ref", mode: 'copy'
     container 'quay.io/biocontainers/samtools:1.3.1--h0cf4675_11'
 
     input:
@@ -89,7 +72,7 @@ process SAMTOOLS_FAIDX_SIMPLE {
 process MAKE_GENOME_BED {
 
     tag "${meta.id}"
-    publishDir params.ref_dir, mode: 'copy'
+    publishDir "${params.outdir}/ref", mode: 'copy'
 
     input:
     tuple val(meta), path(fai)
@@ -207,52 +190,45 @@ process BGZIP_BED {
 workflow {
 
 
-        /*
-     * 1) Reference
-     */
-    def meta_ref = [ id: params.ref_id ]
+    /*
+    * 1) Reference
+    */
+    def meta_ref = [ id: params.genome ?: params.ref_id ]
 
-    Channel.of( [ meta_ref, params.ref_url ] )
-        | DOWNLOAD_REFERENCE
-        | set { ref_ch }   // [meta_ref, fasta]
+    if ( params.genome && !params.igenomes_ignore ) {
 
-    PICARD_CREATESEQUENCEDICTIONARY(ref_ch)
-    BWA_INDEX(ref_ch)
-    SAMTOOLS_FAIDX_SIMPLE(ref_ch)
+        // Use iGenomes assets directly (no download, no indexing)
+        def fasta_path = file(getGenomeAttr('fasta'))
+        def bwa_path   = file(getGenomeAttr('bwa'))
+        def fai_path   = file(getGenomeAttr('fasta_fai'))
+        def dict_path  = file(getGenomeAttr('dict'))
 
-    // Turn reference into VALUE channels
-    ref_ch.first().set                    { ref_val }    // [meta_ref, fasta]
-    BWA_INDEX.out.index.first().set       { index_val }  // [meta_ref, bwa_dir]
-    SAMTOOLS_FAIDX_SIMPLE.out.first().set { fai_val }    // [meta_ref, fasta.fai]
+        Channel.value( tuple(meta_ref, fasta_path) ).set { ref_val }     // [meta, fasta]
+        Channel.value( tuple(meta_ref, bwa_path)   ).set { index_val }   // [meta, bwa index dir]
+        Channel.value( tuple(meta_ref, fai_path)   ).set { fai_val }     // [meta, fai]
 
-    // For DepthOfCoverage: just the FAI path (no meta)
-    fai_val
-        .map { meta, fai -> fai }
-        .set { ch_doc_fai }
+        // Path-only channels for DepthOfCoverage module inputs:
+        Channel.value( fai_path  ).set { ch_doc_fai }
+        Channel.value( dict_path ).set { ch_doc_dict }
 
-
-
-    // For DepthOfCoverage: the .dict path from Picard
-    PICARD_CREATESEQUENCEDICTIONARY.out.reference_dict
-        .first()
-        .map { meta, dict -> dict }
-        .set { ch_doc_dict }
-    
-
+    } else {
+    error "This pipeline is iGenomes-only. Use --genome (e.g. GATK.GRCh38) and do not set --igenomes_ignore."
+    }
 
     /*
-     * 1b) Qualimap regions:
-     *     - If params.qualimap_bed is given -> use that file (e.g. WES targets)
-     *     - Else -> auto-generate a whole-genome BED from the .fai
-     */
+    * 1b) Qualimap regions (must run for both iGenomes and fallback)
+    */
     def ch_qualimap_regions
 
     if ( params.qualimap_bed ) {
         ch_qualimap_regions = Channel.value( file(params.qualimap_bed) )
     } else {
-        MAKE_GENOME_BED(fai_val)
+        MAKE_GENOME_BED(fai_val)  // uses (meta, fai) tuple
         ch_qualimap_regions = MAKE_GENOME_BED.out.map { meta, bed -> bed }
     }
+
+
+
 
 
     /*
@@ -461,14 +437,10 @@ workflow {
     def ch_deep_fai   = fai_val   // (meta_ref, fasta.fai)
 
     // 12.4 Dummy GZI for DeepVariant (must NOT be the .fai file)
-    Channel.value(
-        tuple( [ id: params.ref_id ], file(params.deepvariant_gzi_dummy) )
-    ).set { ch_deep_gzi }   // (meta_ref, dummy_fasta.gzi)
+    Channel.value(tuple( meta_ref, file(params.deepvariant_gzi_dummy) )).set { ch_deep_gzi }
 
     // 12.5 PAR BED (can be empty, no effect if empty)
-    Channel.value(
-        tuple( [ id: params.ref_id ], file(params.par_regions_bed) )
-    ).set { ch_deep_par }   // (meta_ref, par_regions.bed)
+    Channel.value(tuple( meta_ref, file(params.par_regions_bed) )).set { ch_deep_par }
 
     // 12.6 Run DeepVariant with all 5 required input tuples
     DEEPVARIANT_RUNDEEPVARIANT(
@@ -619,6 +591,51 @@ workflow {
         }
 
     BCFTOOLS_NORM_DVONLY(ch_dv_norm_input, ch_ref_fasta)
+
+        
+    /*
+     * 16) Manta germline SV/CNV calling
+     *     Uses the same deduplicated BAMs, reference, and target BED as Strelka.
+     */
+
+    // 16.1 First Manta input:
+    // tuple(meta, input_bams, bai, target_bed, target_bed_tbi)
+    //
+    // Note: 'input' must be a LIST so the module can do input.collect{"--bam ${it}"}.
+    def ch_manta_samples = ch_bam_bai
+        .combine(ch_strelka_bed_gz)      // BED.GZ (value channel)
+        .combine(ch_strelka_bed_index)   // BED.GZ.TBI (value channel)
+        .map { meta, bam, bai, bedgz, bedidx ->
+            tuple(meta, [bam], bai, bedgz, bedidx)   // [bam] => list with one BAM
+        }
+
+    // 16.2 Second input: reference FASTA as tuple(meta_ref, fasta)
+    def ch_manta_fasta = ref_val        // already (meta_ref, fasta)
+
+    // 16.3 Third input: FAI as tuple(meta_ref, fai)
+    def ch_manta_fai = fai_val          // already (meta_ref, fai)
+
+    // 16.4 Fourth input: Manta config file (single path)
+    Channel.value( file(params.manta_config) )
+        .set { ch_manta_config }
+
+    // 16.5 Run Manta
+    MANTA_GERMLINE(
+        ch_manta_samples,   // (meta, [bam], bai, target_bed, target_bed_tbi)
+        ch_manta_fasta,     // (meta_ref, fasta)
+        ch_manta_fai,       // (meta_ref, fai)
+        ch_manta_config     // path(config)
+    )
+
+    // 16.6 Capture outputs (optional channel names if you want them downstream)
+    MANTA_GERMLINE.out.diploid_sv_vcf     .set { ch_manta_diploid_sv_vcf }
+    MANTA_GERMLINE.out.diploid_sv_vcf_tbi .set { ch_manta_diploid_sv_vcf_tbi }
+    MANTA_GERMLINE.out.candidate_sv_vcf   .set { ch_manta_candidate_sv_vcf }
+    MANTA_GERMLINE.out.candidate_sv_vcf_tbi.set { ch_manta_candidate_sv_vcf_tbi }
+    MANTA_GERMLINE.out.candidate_small_indels_vcf   .set { ch_manta_small_indels_vcf }
+    MANTA_GERMLINE.out.candidate_small_indels_vcf_tbi.set { ch_manta_small_indels_vcf_tbi }
+
+
 
 
 
