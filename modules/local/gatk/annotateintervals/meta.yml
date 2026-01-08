@@ -1,0 +1,30 @@
+name: gatk_annotateintervals
+description: Annotate intervals with metrics such as GC content using GATK4 AnnotateIntervals.
+keywords:
+  - gatk
+  - intervals
+  - gc
+tools:
+  - gatk4:
+      description: Genome Analysis Toolkit v4
+      homepage: https://gatk.broadinstitute.org/
+input:
+  - meta:
+      type: map
+      description: Sample or cohort metadata map
+  - intervals:
+      type: file
+      description: BED or interval_list file
+  - ref_fasta:
+      type: file
+      description: Reference FASTA
+  - ref_fai:
+      type: file
+      description: FASTA index (.fai)
+  - ref_dict:
+      type: file
+      description: Sequence dictionary (.dict)
+output:
+  - annotated_intervals:
+      type: file
+      description: Annotated intervals TSV

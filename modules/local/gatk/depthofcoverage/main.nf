@@ -62,6 +62,8 @@ process GATK_DEPTHOFCOVERAGE {
     # GATK4 DepthOfCoverage (BETA)
     gatk \\
         DepthOfCoverage \\
+        --output-format TABLE \\
+        --interval-merging-rule OVERLAPPING_ONLY \\
         -R ${ref_fasta} \\
         -O ${prefix} \\
         -I ${bam} \\

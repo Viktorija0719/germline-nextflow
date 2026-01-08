@@ -1,0 +1,30 @@
+name: xhmm_pipeline
+description: Runs the full XHMM CNV calling workflow starting from GATK DepthOfCoverage sample_interval_summary files.
+keywords:
+  - cnv
+  - xhmm
+  - depthofcoverage
+tools:
+  - xhmm:
+      description: eXome-Hidden Markov Model CNV caller
+      homepage: https://atgu.mgh.harvard.edu/xhmm/
+input:
+  - gatk_summaries:
+      type: file(list)
+      description: One or more *.sample_interval_summary files
+  - annotated_intervals:
+      type: file(optional)
+      description: GATK AnnotateIntervals TSV (used to derive GC targets)
+  - extreme_gc_targets:
+      type: file(optional)
+      description: Targets to exclude due to extreme GC
+  - xhmm_params:
+      type: file
+      description: XHMM params.txt file
+output:
+  - xcnv:
+      type: file
+      description: Discovered CNVs in XHMM .xcnv format
+  - aux_xcnv:
+      type: file
+      description: Auxiliary CNV output (can be large)

@@ -23,6 +23,8 @@ include { BCFTOOLS_CONCAT as BCFTOOLS_CONCAT_VCF      } from './modules/nf-core/
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_COMBINED   } from './modules/nf-core/bcftools/norm'
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_DVONLY     } from './modules/nf-core/bcftools/norm'
 include { MANTA_GERMLINE } from './modules/nf-core/manta/germline/main'
+include { GATK_ANNOTATEINTERVALS } from './modules/local/gatk/annotateintervals/main'
+include { XHMM_PIPELINE         } from './modules/local/xhmm/main'
 
 
 
@@ -411,6 +413,63 @@ workflow {
     
 
     GATK_DEPTHOFCOVERAGE.out.coverage.set { ch_doc_coverage }
+
+
+    /*
+    * 11b) XHMM CNV pipeline (cohort-level)
+    *      Requires DepthOfCoverage to output TABLE (tab/space delimited)
+    */
+if ( params.xhmm_enable ) {
+
+    def meta_xhmm = [ id: (params.xhmm_prefix ?: 'DATA') ]
+
+    // Extract per-sample .sample_interval_summary
+    def ch_doc_sample_interval_summary = ch_doc_coverage
+        .map { meta, files ->
+            def sis = files.find { it.name.endsWith('.sample_interval_summary') }
+            if( !sis ) error "DepthOfCoverage outputs for '${meta.id}' do not contain a .sample_interval_summary file"
+            tuple(meta, sis)
+        }
+
+    // Collect into one list (cohort-level run)
+    def ch_xhmm_gatk_summaries = ch_doc_sample_interval_summary
+        .map { meta, sis -> sis }
+        .collect()
+        .map { summaries -> tuple(meta_xhmm, summaries) }
+
+    def ch_xhmm_params = Channel.value( file(params.xhmm_param_file) )
+
+    // Always pass a file (either user-provided or empty placeholder)
+    def ch_xhmm_extreme_gc = Channel.value(
+        params.xhmm_extreme_gc_targets
+            ? file(params.xhmm_extreme_gc_targets)
+            : file("${baseDir}/resources/xhmm/empty_targets.txt")
+    )
+
+    // Always run AnnotateIntervals (simple + avoids “optional input” problems)
+    def ch_xhmm_intervals_for_annot = Channel.value(
+        tuple(meta_xhmm, file(params.xhmm_intervals))
+    )
+
+    GATK_ANNOTATEINTERVALS(
+        ch_xhmm_intervals_for_annot,
+        ch_doc_ref,
+        ch_doc_fai,
+        ch_doc_dict
+    )
+
+    def ch_xhmm_annotated = GATK_ANNOTATEINTERVALS.out.tsv.map { meta, tsv -> tsv }
+
+    XHMM_PIPELINE(
+        ch_xhmm_gatk_summaries,
+        ch_xhmm_annotated,
+        ch_xhmm_extreme_gc,
+        ch_xhmm_params
+    )
+}
+
+
+
 
 
 

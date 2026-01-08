@@ -1,0 +1,6 @@
+---
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - bioconda::xhmm=0.0.0.2016_01_04.cc14e52
