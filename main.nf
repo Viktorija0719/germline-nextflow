@@ -136,7 +136,9 @@ process MERGE_BAMS {
 process PICARDLIKE_DUPMETRICS {
   tag "${meta.id}"
   label 'process_single'
-  container 'quay.io/biocontainers/coreutils:9.5--a9c29d0e2be5c7b6'  // just needs tail/cat
+  container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+    'https://depot.galaxyproject.org/singularity/coreutils:9.5' :
+    'quay.io/biocontainers/coreutils:9.5' }" 
 
   input:
   tuple val(meta), path(metrics)
