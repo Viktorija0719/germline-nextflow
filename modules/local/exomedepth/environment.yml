@@ -1,0 +1,11 @@
+name: exomedepth_callcnv
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.4.*
+  - r-exomedepth=1.1.18
+  - bioconductor-rsamtools
+  - bioconductor-genomicranges
+  - bioconductor-iranges
+  - r-data.table

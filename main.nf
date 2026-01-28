@@ -27,6 +27,8 @@ include { STRELKA_CHRM_FILTER          } from './modules/local/strelka/chrm_filt
 include { BCFTOOLS_CONCAT as BCFTOOLS_CONCAT_VCF } from './modules/nf-core/bcftools/concat'
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_COMBINED } from './modules/nf-core/bcftools/norm'
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_DVONLY } from './modules/nf-core/bcftools/norm'
+include { EXOMEDEPTH } from './modules/local/exomedepth'
+
 
 /*
  * Your requested interval modules
@@ -186,25 +188,30 @@ process BGZIP_BED {
 /*
  * Gather scattered DV chunk VCFs into one per sample
  */
+
 process GATHER_DEEPVARIANT_VCFS {
-  tag "${sample_id}"
+  tag "${meta.id}"
   label 'process_small'
   container 'quay.io/biocontainers/bcftools:1.22--h3a4d415_2'
 
   input:
-  val sample_id
-  path vcfs
-  path tbis
+  tuple val(meta), path(vcfs), path(tbis)
 
   output:
-  tuple val([id: sample_id]), path("${sample_id}.deepvariant.vcf.gz"), path("${sample_id}.deepvariant.vcf.gz.tbi"), emit: vcf
+  tuple val(meta), path("${meta.id}.deepvariant.vcf.gz"), path("${meta.id}.deepvariant.vcf.gz.tbi"), emit: vcf
+  path "versions.yml", emit: versions
 
   script:
   """
   set -euo pipefail
-  printf "%s\\n" ${vcfs} | LC_ALL=C sort -V > vcfs.list
-  bcftools concat -a -D -Oz -o ${sample_id}.deepvariant.vcf.gz -f vcfs.list
-  bcftools index -t ${sample_id}.deepvariant.vcf.gz
+
+  bcftools concat -Oz -o ${meta.id}.deepvariant.vcf.gz ${vcfs}
+  tabix -f ${meta.id}.deepvariant.vcf.gz
+
+  cat <<-END_VERSIONS > versions.yml
+  "${task.process}":
+      bcftools: \$(bcftools --version | head -n1 | awk '{print \$2}')
+  END_VERSIONS
   """
 }
 
@@ -478,8 +485,9 @@ workflow {
       .join(DEEPVARIANT_RUNDEEPVARIANT.out.vcf_index)
       .map { meta, vcf, tbi -> tuple(meta.sample_id, vcf, tbi) }
       .groupTuple()
-      .map { sample_id, vcfs, tbis -> tuple(sample_id, vcfs, tbis) }
+      .map { sample_id, vcfs, tbis -> tuple([id: sample_id], vcfs, tbis) }
       .set { ch_dv_gather_in }
+
 
     GATHER_DEEPVARIANT_VCFS(ch_dv_gather_in)
     ch_dv_vcf = GATHER_DEEPVARIANT_VCFS.out.vcf
@@ -535,6 +543,73 @@ workflow {
     Channel.value(file(params.manta_config)).set { ch_manta_config }
     MANTA_GERMLINE(ch_manta_samples, ref_val, fai_val, ch_manta_config)
   }
+
+  // ---- ExomeDepth ----
+
+  if (params.exomedepth_enable) {
+
+      // 1) Join BAM + BAI (and idxstats if you have it)
+      //    Join key should match what you use elsewhere (often meta.id or meta.sample).
+      //    In your pipeline you often join by meta.id; for ExomeDepth you want sample-level.
+      def ch_bam_bai = ch_rmdup_bam
+        .map { meta, bam -> tuple(meta.sample, meta, bam) }
+        .join(
+          ch_rmdup_bai.map { meta, bai -> tuple(meta.sample, bai) }
+        ) { it[0] }  // join by sample
+        .map { sample, meta, bam, bai -> tuple(meta, bam, bai) }
+
+      // Optional idxstats join (recommended if you want include_x TRUE)
+      def ch_bam_bai_idx = ch_idxstats ? ch_bam_bai
+        .map { meta, bam, bai -> tuple(meta.sample, meta, bam, bai) }
+        .join(
+          ch_idxstats.map { meta, idx -> tuple(meta.sample, idx) }
+        ) { it[0] }
+        .map { sample, meta, bam, bai, idx -> tuple(meta, bam, bai, idx) }
+        :
+        ch_bam_bai.map { meta, bam, bai -> tuple(meta, bam, bai, null) }
+
+      // 2) Collect cohort into one payload (samples[], bams[], bais[], idxstats[])
+      def ch_exomedepth_payload = ch_bam_bai_idx
+        .map { meta, bam, bai, idx ->
+          tuple(meta.sample, bam, bai, idx)
+        }
+        .collect()
+        .map { rows ->
+          def samples  = rows.collect { it[0] }
+          def bams     = rows.collect { it[1] }
+          def bais     = rows.collect { it[2] }
+          def idxstats = rows.collect { it[3] }.findAll { it != null }
+
+          // choose bed: prefer prepared bed from your pipeline
+          // if user provided params.exomedepth_bed, you can stage that instead
+          tuple(
+            [ id: 'exomedepth' ],
+            samples,
+            bams,
+            bais,
+            idxstats,          // can be empty list
+            fasta,             // or ch_fasta if you keep it as a channel
+            exomedepth_bed_prepared  // define below
+          )
+        }
+
+      // 3) Define bed input (prefer your PREPARE_BED output)
+      // If you already prepared the target bed earlier, reuse that channel output.
+      // Otherwise, you can just pass params.exomedepth_bed as a path.
+      def exomedepth_bed_prepared = (params.exomedepth_bed ? file(params.exomedepth_bed) : prepared_target_bed)
+
+      // 4) Call the module with task.ext overrides
+      EXOMEDEPTH(ch_exomedepth_payload) {
+        ext.include_x   = params.exomedepth_include_x
+        ext.include_chr = params.exomedepth_include_chr
+        ext.prefix      = 'exomedepth'
+        // ext.args      = '--some_extra_flag value'   // if needed later
+        ext.singularity_pull_docker_container = params.singularity_pull_docker_container
+      }
+    }
+
+
+
 
   // ---- Combine DV + Strelka ----
   if (params.combine_dv_strelka_enable) {
