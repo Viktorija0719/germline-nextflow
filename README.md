@@ -1,4 +1,3 @@
-````markdown
 # germline-nextflow
 
 A modular **Nextflow DSL2** pipeline for **germline variant analysis** (WES/WGS), supporting SNV/indel and CNV/SV workflows with optional cohort-level CNV modules.
@@ -24,7 +23,11 @@ It is designed for both **local** and **HPC** execution using containers (Docker
 
 ## Workflow
 
-![Germline Variant Calling Workflow](variant_workflow_recreated.png)
+<img src="variant_workflow_recreated.png" width="60%">
+
+<!-- <p align="center">
+  <img src="variant_workflow_recreated.png" alt="Germline Variant Calling Workflow" width="900">
+</p> -->
 
 ---
 
