@@ -23,7 +23,7 @@ It is designed for both **local** and **HPC** execution using containers (Docker
 
 ## Workflow
 
-<img src="variant_workflow_recreated.png" width="60%">
+<img src="variant_workflow_recreated.png" width="80%">
 
 <!-- <p align="center">
   <img src="variant_workflow_recreated.png" alt="Germline Variant Calling Workflow" width="900">
