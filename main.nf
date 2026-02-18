@@ -27,8 +27,6 @@ include { STRELKA_CHRM_FILTER          } from './modules/local/strelka/chrm_filt
 include { BCFTOOLS_CONCAT as BCFTOOLS_CONCAT_VCF } from './modules/nf-core/bcftools/concat'
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_COMBINED } from './modules/nf-core/bcftools/norm'
 include { BCFTOOLS_NORM  as BCFTOOLS_NORM_DVONLY } from './modules/nf-core/bcftools/norm'
-include { EXOMEDEPTH } from './modules/local/exomedepth'
-
 
 /*
  * Your requested interval modules
@@ -46,6 +44,12 @@ include { PREPARE_BED as PREPARE_BED_XHMM } from './modules/local/prepare_bed'
 include { PREPARE_BED as PREPARE_BED_MASTER } from './modules/local/prepare_bed'
 include { PREPARE_BED as PREPARE_BED_VARIANT } from './modules/local/prepare_bed'
 
+include { EXOMEDEPTH } from './modules/local/exomedepth'
+
+// need a dedicated alias for the bed you’ll feed into ExomeDepth
+include { PREPARE_BED as PREPARE_BED_EXOMEDEPTH } from './modules/local/prepare_bed'
+
+
 
 /*
  * -------------------------
@@ -62,6 +66,58 @@ def getGenomeAttr(String attr) {
     error "Genome '${params.genome}' does not define '${attr}' in conf/igenomes.config"
   }
   return g[attr]
+}
+
+def readSampleSheetInfo(Object csvPathObj) {
+  def csvPath = csvPathObj.toString()
+  def f = new File(csvPath)
+  if (!f.exists()) error "Samplesheet not found: ${csvPath}"
+
+  def lines = f.readLines().findAll { it?.trim() }
+  if (lines.size() < 2) error "Samplesheet has no data rows: ${csvPath}"
+
+  def header = lines[0].split(',', -1)*.trim()
+  def idxSample  = header.indexOf('sample')
+  def idxPatient = header.indexOf('patient')
+
+  if (idxSample < 0) {
+    error "Samplesheet must contain 'sample' column: ${csvPath}"
+  }
+
+  def sample2patient = [:]
+  lines.tail().each { ln ->
+    def cols = ln.split(',', -1)
+    if (cols.size() > idxSample) {
+      def sid = cols[idxSample]?.trim()
+      if (sid) {
+        def pat = (idxPatient >= 0 && idxPatient < cols.size()) ? cols[idxPatient]?.trim() : ''
+        if (!sample2patient.containsKey(sid)) {
+          sample2patient[sid] = pat ?: sid
+        }
+      }
+    }
+  }
+
+  if (sample2patient.isEmpty()) {
+    error "No sample IDs parsed from: ${csvPath}"
+  }
+
+  return [
+    sampleIds      : sample2patient.keySet().toList().sort(),
+    sample2patient : sample2patient
+  ]
+}
+
+def findMissingBamBai(List sampleIds, String bamDir) {
+  sampleIds.findAll { sid ->
+    !new File("${bamDir}/${sid}.bam").exists() || !new File("${bamDir}/${sid}.bam.bai").exists()
+  }
+}
+
+def findMissingMetrics(List sampleIds, String bamDir) {
+  sampleIds.findAll { sid ->
+    !new File("${bamDir}/${sid}.metrics.txt").exists()
+  }
 }
 
 
@@ -138,9 +194,8 @@ process MERGE_BAMS {
 process PICARDLIKE_DUPMETRICS {
   tag "${meta.id}"
   label 'process_single'
-  container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
-    'https://depot.galaxyproject.org/singularity/coreutils:9.5' :
-    'quay.io/biocontainers/coreutils:9.5' }" 
+  // Run on host (no container) to avoid intermittent SIGBUS/SIGSEGV in coreutils
+  // container on this HPC BeeGFS + Singularity setup.
 
   input:
   tuple val(meta), path(metrics)
@@ -151,14 +206,12 @@ process PICARDLIKE_DUPMETRICS {
   script:
   """
   set -euo pipefail
-  tail -n +4 ${metrics} > body.txt
 
-  cat > header.txt <<'EOF'
-##htsjdk.samtools.metrics.StringHeader
-##METRICS CLASS picard.sam.DuplicationMetrics
-EOF
-
-  cat header.txt body.txt > ${meta.id}.duplicate_metrics_picard_like.txt
+  {
+    echo '##htsjdk.samtools.metrics.StringHeader'
+    echo '##METRICS CLASS picard.sam.DuplicationMetrics'
+    awk 'NR>3' ${metrics}
+  } > ${meta.id}.duplicate_metrics_picard_like.txt
   """
 }
 
@@ -188,7 +241,6 @@ process BGZIP_BED {
 /*
  * Gather scattered DV chunk VCFs into one per sample
  */
-
 process GATHER_DEEPVARIANT_VCFS {
   tag "${meta.id}"
   label 'process_small'
@@ -199,19 +251,13 @@ process GATHER_DEEPVARIANT_VCFS {
 
   output:
   tuple val(meta), path("${meta.id}.deepvariant.vcf.gz"), path("${meta.id}.deepvariant.vcf.gz.tbi"), emit: vcf
-  path "versions.yml", emit: versions
 
   script:
   """
   set -euo pipefail
-
-  bcftools concat -Oz -o ${meta.id}.deepvariant.vcf.gz ${vcfs}
-  tabix -f ${meta.id}.deepvariant.vcf.gz
-
-  cat <<-END_VERSIONS > versions.yml
-  "${task.process}":
-      bcftools: \$(bcftools --version | head -n1 | awk '{print \$2}')
-  END_VERSIONS
+  printf "%s\\n" ${vcfs} | LC_ALL=C sort -V > vcfs.list
+  bcftools concat -a -D -Oz -o ${meta.id}.deepvariant.vcf.gz -f vcfs.list
+  bcftools index -t ${meta.id}.deepvariant.vcf.gz
   """
 }
 
@@ -253,68 +299,135 @@ workflow {
     .set { ch_genome_bed }
 
 
+
   /*
    * -------------------------
-   * Input samplesheet: patient,sample,lane,fastq_1,fastq_2
-   * meta.id unique per row (lane); meta.sample preserved for biological sample
+   * Reuse precomputed BAM/BAI if complete
    * -------------------------
    */
-  Channel
-    .fromPath(params.input, checkIfExists: true)
-    .splitCsv(header: true)
-    .map { row ->
-      def sample = row.sample.toString()
-      def lane   = (row.lane ?: 'L1').toString()
+  def ss = readSampleSheetInfo(params.input)
+  def sampleIds = ss.sampleIds
+  def sample2patient = ss.sample2patient
+  def bamDir = params.existing_bam_dir.toString()
 
-      def meta = [
-        id      : "${sample}_${lane}",
-        sample  : sample,
-        patient : row.patient,
-        lane    : lane
-      ]
+  def missingPairs = findMissingBamBai(sampleIds, bamDir)
+  boolean useExistingNow = false
 
-      tuple(meta, [ file(row.fastq_1), file(row.fastq_2) ])
+  if (params.use_existing_bams as boolean) {
+    if (missingPairs) {
+      def msg = "Missing BAM/BAI in ${bamDir} for ${missingPairs.size()} sample(s): ${missingPairs.join(', ')}"
+      if (params.existing_bams_strict as boolean) {
+        error msg
+      }
+      log.warn "${msg}. Falling back to FASTQ alignment branch."
+      useExistingNow = false
+    } else {
+      useExistingNow = true
+      log.info "Reusing precomputed BAM/BAI from ${bamDir}; skipping BWA->ADD_READGROUPS->MERGE_BAMS->BAMMARKDUPLICATES2->SAMTOOLS_INDEX."
     }
-    .set { ch_reads }
+  }
 
-  /*
-   * -------------------------
-   * Alignment → lane BAM
-   * -------------------------
-   */
-  BWA_MEM(ch_reads, index_val, ref_val, true)
-  BWA_MEM.out.bam.set { ch_bam_lane }
+  def ch_bam_final
+  def ch_bai
+  def ch_dup_metrics = null
+  boolean run_picardlike = false
 
-  /*
-   * Add read groups per lane
-   */
-  ADD_READGROUPS(ch_bam_lane)
-  ADD_READGROUPS.out.bam.set { ch_bam_rg_lane }
+  if (useExistingNow) {
 
-  /*
-   * Merge per sample (group by meta.sample), then mark duplicates once
-   */
-  ch_bam_rg_lane
-    .map { meta, bam -> tuple(meta.sample, meta, bam) }
-    .groupTuple()
-    .map { sample, metas, bams ->
-      def m0 = metas[0]
-      def merged_meta = [ id: sample, sample: sample, patient: m0.patient ]
-      tuple(merged_meta, bams)
+    ch_bam_final = Channel.fromList(sampleIds)
+      .map { sid ->
+        def meta = [id: sid, sample: sid, patient: sample2patient[sid]]
+        tuple(meta, file("${bamDir}/${sid}.bam", checkIfExists: true))
+      }
+
+    ch_bai = Channel.fromList(sampleIds)
+      .map { sid ->
+        def meta = [id: sid, sample: sid, patient: sample2patient[sid]]
+        tuple(meta, file("${bamDir}/${sid}.bam.bai", checkIfExists: true))
+      }
+
+    def missingMetrics = findMissingMetrics(sampleIds, bamDir)
+    if (missingMetrics) {
+      log.warn "Found BAM/BAI, but missing *.metrics.txt for ${missingMetrics.size()} sample(s). PICARDLIKE_DUPMETRICS will be skipped."
+    } else {
+      ch_dup_metrics = Channel.fromList(sampleIds)
+        .map { sid ->
+          def meta = [id: sid, sample: sid, patient: sample2patient[sid]]
+          tuple(meta, file("${bamDir}/${sid}.metrics.txt", checkIfExists: true))
+        }
+      run_picardlike = true
     }
-    .set { ch_merge_in }
 
-  MERGE_BAMS(ch_merge_in)
-  MERGE_BAMS.out.bam.set { ch_bam_merged }
+  } else {
 
-  BIOBAMBAM_BAMMARKDUPLICATES2(ch_bam_merged)
-  BIOBAMBAM_BAMMARKDUPLICATES2.out.bam.set     { ch_bam_final }
-  BIOBAMBAM_BAMMARKDUPLICATES2.out.metrics.set { ch_dup_metrics }
+    /*
+     * -------------------------
+     * Input samplesheet: patient,sample,lane,fastq_1,fastq_2
+     * meta.id unique per row (lane); meta.sample preserved for biological sample
+     * -------------------------
+     */
+    Channel
+      .fromPath(params.input, checkIfExists: true)
+      .splitCsv(header: true)
+      .map { row ->
+        def sample = row.sample.toString()
+        def lane   = (row.lane ?: 'L1').toString()
 
-  SAMTOOLS_INDEX(ch_bam_final)
-  SAMTOOLS_INDEX.out.bai.set { ch_bai }
+        def meta = [
+          id      : "${sample}_${lane}",
+          sample  : sample,
+          patient : row.patient,
+          lane    : lane
+        ]
 
-  PICARDLIKE_DUPMETRICS(ch_dup_metrics)
+        tuple(meta, [ file(row.fastq_1), file(row.fastq_2) ])
+      }
+      .set { ch_reads }
+
+   /*
+    * -------------------------
+    * Alignment → lane BAM
+    * -------------------------
+    */
+    BWA_MEM(ch_reads, index_val, ref_val, true)
+    BWA_MEM.out.bam.set { ch_bam_lane }
+
+    /*
+    * Add read groups per lane
+    */
+    ADD_READGROUPS(ch_bam_lane)
+    ADD_READGROUPS.out.bam.set { ch_bam_rg_lane }
+
+    /*
+    * Merge per sample (group by meta.sample), then mark duplicates once
+    */
+    ch_bam_rg_lane
+      .map { meta, bam -> tuple(meta.sample, meta, bam) }
+      .groupTuple()
+      .map { sample, metas, bams ->
+        def m0 = metas[0]
+        def merged_meta = [ id: sample, sample: sample, patient: m0.patient ]
+        tuple(merged_meta, bams)
+      }
+      .set { ch_merge_in }
+
+    MERGE_BAMS(ch_merge_in)
+    MERGE_BAMS.out.bam.set { ch_bam_merged }
+
+    BIOBAMBAM_BAMMARKDUPLICATES2(ch_bam_merged)
+    BIOBAMBAM_BAMMARKDUPLICATES2.out.bam.set     { ch_bam_final }
+    BIOBAMBAM_BAMMARKDUPLICATES2.out.metrics.set { ch_dup_metrics }
+
+    SAMTOOLS_INDEX(ch_bam_final)
+    SAMTOOLS_INDEX.out.bai.set { ch_bai }
+
+    run_picardlike = true
+  }
+
+  if ((params.picardlike_enable == null || params.picardlike_enable) && run_picardlike && ch_dup_metrics != null) {
+    PICARDLIKE_DUPMETRICS(ch_dup_metrics)
+  }
+
 
   /*
    * Robust BAM/BAI join by meta.id
@@ -357,6 +470,114 @@ workflow {
 
     QUALIMAP_BAMQC(ch_bam_final, ch_qualimap_bed)
   }
+
+
+
+
+
+  /*
+   * -------------------------
+   * ExomeDepth toggle (cohort-level)
+   * -------------------------
+   */
+
+if (params.exomedepth_enable) {
+    if (!params.idxstats_enable) {
+      error "EXOMEDEPTH requires --idxstats_enable true (SAMTOOLS_IDXSTATS)"
+    }
+
+    // Cohort-level meta for ExomeDepth
+    def meta_exd = [ id:'cohort', sample:'cohort', patient:'cohort' ]
+
+    // ExomeDepth BED: exomedepth_target_bed > master_bed > genome intervals
+    def role_bed_raw = params.master_bed
+      ? Channel.value(file(params.master_bed))
+      : ch_genome_bed
+
+    def exd_raw = params.exomedepth_target_bed
+      ? Channel.value(file(params.exomedepth_target_bed))
+      : role_bed_raw
+
+    PREPARE_BED_EXOMEDEPTH(exd_raw, ch_ref_fai_path)
+    def ch_exd_bed = PREPARE_BED_EXOMEDEPTH.out.out_bed
+
+    // Build a map: sample_id -> idxstats_path
+    def ch_idx_map = SAMTOOLS_IDXSTATS.out.idxstats
+      .map { rec ->
+        if (!(rec instanceof List) || rec.size() < 2) {
+          error "Expected tuple(meta, idxstats), got: ${rec?.getClass()?.name} -> ${rec}"
+        }
+        def m = rec[0]
+        def idx = rec[1]
+        def sid = (m instanceof Map && m.id != null) ? m.id.toString() : m.toString()
+        tuple(sid, idx)
+      }
+      .collect(flat: false)
+      .map { pairs ->
+        def out = [:]
+        pairs.each { p ->
+          if (!(p instanceof List) || p.size() < 2) {
+            error "Malformed idxstats pair: ${p}"
+          }
+          out[(p[0].toString())] = p[1]
+        }
+        out
+      }
+
+    // One cohort tuple with arrays aligned by sample order
+    def ch_cohort_box = ch_bam_bai
+      .collect(flat: false)
+      .map { cohort -> tuple([cohort: cohort]) }   // box to prevent combine flattening
+
+    ch_cohort_box
+      .combine(ch_idx_map)
+      .combine(ch_exd_bed)
+      .map { box, idxmap, bed ->
+
+        def cohort = box.cohort
+        if (!(cohort instanceof List) || cohort.isEmpty()) {
+          error "ExomeDepth cohort is empty or malformed: ${cohort}"
+        }
+
+        // normalize rows to [sid, bam, bai]
+        def rows = cohort.collect { row ->
+          if (!(row instanceof List) || row.size() < 3) {
+            error "Malformed cohort row for ExomeDepth: ${row}"
+          }
+
+          def m = row[0]
+          def sid =
+              (m instanceof Map && m.containsKey('id') && m['id'] != null) ? m['id'].toString() :
+              (m instanceof Map && m.containsKey('sample') && m['sample'] != null) ? m['sample'].toString() :
+              m.toString()
+
+          [sid, row[1], row[2]]
+        }
+
+        rows = rows.sort { x, y -> x[0] <=> y[0] }
+
+        def samples = rows.collect { it[0] }
+        def bams    = rows.collect { it[1] }
+        def bais    = rows.collect { it[2] }
+
+        def idxs = samples.collect { sid ->
+          def p = idxmap[sid]
+          if (!p) {
+            error "Missing idxstats for sample '${sid}' (available: ${idxmap.keySet().sort().join(', ')})"
+          }
+          p
+        }
+
+        tuple(meta_exd, samples, bams, bais, idxs, fasta_path, bed)
+      }
+      .set { ch_exd_input }
+
+
+    EXOMEDEPTH(ch_exd_input)
+  }
+
+
+
 
   /*
    * -------------------------
@@ -483,11 +704,11 @@ workflow {
 
     DEEPVARIANT_RUNDEEPVARIANT.out.vcf
       .join(DEEPVARIANT_RUNDEEPVARIANT.out.vcf_index)
-      .map { meta, vcf, tbi -> tuple(meta.sample_id, vcf, tbi) }
+      // Re-key per-sample and rebuild a clean nf-core style meta map
+      .map { meta, vcf, tbi -> tuple([id: meta.sample_id, sample: meta.sample_id, patient: meta.patient], vcf, tbi) }
       .groupTuple()
-      .map { sample_id, vcfs, tbis -> tuple([id: sample_id], vcfs, tbis) }
+      .map { meta, vcfs, tbis -> tuple(meta, vcfs, tbis) }
       .set { ch_dv_gather_in }
-
 
     GATHER_DEEPVARIANT_VCFS(ch_dv_gather_in)
     ch_dv_vcf = GATHER_DEEPVARIANT_VCFS.out.vcf
@@ -544,72 +765,6 @@ workflow {
     MANTA_GERMLINE(ch_manta_samples, ref_val, fai_val, ch_manta_config)
   }
 
-  // ---- ExomeDepth ----
-
-  if (params.exomedepth_enable) {
-
-      // 1) Join BAM + BAI (and idxstats if you have it)
-      //    Join key should match what you use elsewhere (often meta.id or meta.sample).
-      //    In your pipeline you often join by meta.id; for ExomeDepth you want sample-level.
-      def ch_bam_bai = ch_rmdup_bam
-        .map { meta, bam -> tuple(meta.sample, meta, bam) }
-        .join(
-          ch_rmdup_bai.map { meta, bai -> tuple(meta.sample, bai) }
-        ) { it[0] }  // join by sample
-        .map { sample, meta, bam, bai -> tuple(meta, bam, bai) }
-
-      // Optional idxstats join (recommended if you want include_x TRUE)
-      def ch_bam_bai_idx = ch_idxstats ? ch_bam_bai
-        .map { meta, bam, bai -> tuple(meta.sample, meta, bam, bai) }
-        .join(
-          ch_idxstats.map { meta, idx -> tuple(meta.sample, idx) }
-        ) { it[0] }
-        .map { sample, meta, bam, bai, idx -> tuple(meta, bam, bai, idx) }
-        :
-        ch_bam_bai.map { meta, bam, bai -> tuple(meta, bam, bai, null) }
-
-      // 2) Collect cohort into one payload (samples[], bams[], bais[], idxstats[])
-      def ch_exomedepth_payload = ch_bam_bai_idx
-        .map { meta, bam, bai, idx ->
-          tuple(meta.sample, bam, bai, idx)
-        }
-        .collect()
-        .map { rows ->
-          def samples  = rows.collect { it[0] }
-          def bams     = rows.collect { it[1] }
-          def bais     = rows.collect { it[2] }
-          def idxstats = rows.collect { it[3] }.findAll { it != null }
-
-          // choose bed: prefer prepared bed from your pipeline
-          // if user provided params.exomedepth_bed, you can stage that instead
-          tuple(
-            [ id: 'exomedepth' ],
-            samples,
-            bams,
-            bais,
-            idxstats,          // can be empty list
-            fasta,             // or ch_fasta if you keep it as a channel
-            exomedepth_bed_prepared  // define below
-          )
-        }
-
-      // 3) Define bed input (prefer your PREPARE_BED output)
-      // If you already prepared the target bed earlier, reuse that channel output.
-      // Otherwise, you can just pass params.exomedepth_bed as a path.
-      def exomedepth_bed_prepared = (params.exomedepth_bed ? file(params.exomedepth_bed) : prepared_target_bed)
-
-      // 4) Call the module with task.ext overrides
-      EXOMEDEPTH(ch_exomedepth_payload) {
-        ext.include_x   = params.exomedepth_include_x
-        ext.include_chr = params.exomedepth_include_chr
-        ext.prefix      = 'exomedepth'
-        // ext.args      = '--some_extra_flag value'   // if needed later
-        ext.singularity_pull_docker_container = params.singularity_pull_docker_container
-      }
-    }
-
-
-
 
   // ---- Combine DV + Strelka ----
   if (params.combine_dv_strelka_enable) {
@@ -620,31 +775,46 @@ workflow {
         log.warn "Skipping DV+Strelka combine: requires deepvariant_enable && strelka_enable"
       }
     } else {
-      def ch_concat_in = ch_dv_vcf
-        .join(ch_strelka_vcf)
-        .map { meta, dv_vcf, dv_tbi, st_vcf, st_tbi ->
-          def m = meta.clone()
-          m.id = "${meta.id}.DV_ST2.comb"
-          tuple(m, [dv_vcf, st_vcf], [dv_tbi, st_tbi])
+
+      /*
+       * IMPORTANT:
+       * Use meta.id as the join key (not the full meta map) so joins work even if
+       * meta carries different extra fields between callers.
+       */
+      def ch_dv_keyed = ch_dv_vcf
+        .map { meta, vcf, tbi -> tuple(meta.id, meta, vcf, tbi) }
+
+      def ch_strelka_keyed = ch_strelka_vcf
+        .map { meta, vcf, tbi -> tuple(meta.id, meta, vcf, tbi) }
+
+      def ch_concat_in = ch_dv_keyed
+        .join(ch_strelka_keyed)
+        .map { sid, meta_dv, dv_vcf, dv_tbi, meta_st, st_vcf, st_tbi ->
+          def meta = (meta_st ?: meta_dv).clone()
+          meta.id = "${sid}.DV_ST2.comb"
+          tuple(meta, [dv_vcf, st_vcf], [dv_tbi, st_tbi])
         }
 
       BCFTOOLS_CONCAT_VCF(ch_concat_in)
 
-      def ch_combined_vcf = BCFTOOLS_CONCAT_VCF.out.vcf.join(BCFTOOLS_CONCAT_VCF.out.tbi)
+      def ch_combined_vcf = BCFTOOLS_CONCAT_VCF.out.vcf
+        .join(BCFTOOLS_CONCAT_VCF.out.tbi)
 
       if (params.norm_combined_enable) {
         def ch_norm_in = ch_combined_vcf
           .map { meta, vcf, tbi ->
             def m = meta.clone()
-            m.id = "${meta.id}.DV_ST2.comb.norm"
+            m.id = "${meta.id}.norm"
             tuple(m, vcf, tbi)
           }
+
         BCFTOOLS_NORM_COMBINED(ch_norm_in, ref_val)
       }
     }
   }
 
   // ---- DV-only normalization ----
+
   if (run_dv && params.norm_dv_only_enable) {
     def ch_dv_norm_in = ch_dv_vcf
       .map { meta, vcf, tbi ->
