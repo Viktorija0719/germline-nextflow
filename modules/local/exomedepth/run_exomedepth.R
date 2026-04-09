@@ -285,11 +285,23 @@ infer_sex_from_idxstats_dir <- function(samples, idxstats_dir) {
 # getBamCounts conversion (robust)
 # ---------------------------
 get_counts_objects <- function(targets_df, bam_files, include_chr, fasta) {
-  counts_obj <- ExomeDepth::getBamCounts(
-    bed.frame = targets_df,
-    bam.files = bam_files,
-    include.chr = include_chr,
-    referenceFasta = fasta
+  counts_obj <- tryCatch(
+    ExomeDepth::getBamCounts(
+      bed.frame = targets_df,
+      bam.files = bam_files,
+      include.chr = include_chr,
+      referenceFasta = fasta
+    ),
+    error = function(e) {
+      message("getBamCounts with referenceFasta failed (likely HLA/alt contig names in FASTA): ",
+              conditionMessage(e))
+      message("Retrying without referenceFasta — GC content will not be computed.")
+      ExomeDepth::getBamCounts(
+        bed.frame = targets_df,
+        bam.files = bam_files,
+        include.chr = include_chr
+      )
+    }
   )
 
   if (inherits(counts_obj, "GRanges")) {

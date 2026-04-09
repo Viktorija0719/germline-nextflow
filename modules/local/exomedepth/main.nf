@@ -104,3 +104,4 @@ EOF
       \$IDX_ARG \\
       ${extra_args}
     """
+}

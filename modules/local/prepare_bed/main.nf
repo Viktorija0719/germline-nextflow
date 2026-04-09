@@ -53,7 +53,7 @@ process PREPARE_BED {
          \$0 ~ /^#/     {next}
          \$0 ~ /^track/ {next}
          NF < 3                               {next}
-         \$2 !~ /^[0-9]+$/ || \$3 !~ /^[0-9]+$/ {next}
+         (length(\$2)==0 || \$2 ~ /[^0-9]/) || (length(\$3)==0 || \$3 ~ /[^0-9]/) {next}
          \$2 >= \$3                            {next}
          {print \$0}' > cleaned.raw.bed
 

@@ -28,22 +28,40 @@ process BWA_MEM {
     def args2 = task.ext.args2 ?: ''
     def prefix = task.ext.prefix ?: "${meta.id}"
     def samtools_command = sort_bam ? 'sort' : 'view'
+    def sort_mem = task.ext.sort_mem ?: '768M'
+
     def extension = args2.contains("--output-fmt sam")   ? "sam" :
                     args2.contains("--output-fmt cram")  ? "cram":
                     sort_bam && args2.contains("-O cram")? "cram":
                     !sort_bam && args2.contains("-C")    ? "cram":
                     "bam"
-    def reference = fasta && extension=="cram"  ? "--reference ${fasta}" : ""
+
+    def reference = fasta && extension=="cram" ? "--reference ${fasta}" : ""
     if (!fasta && extension=="cram") error "Fasta reference is required for CRAM output"
+
+    // Temp handling for samtools sort (fixes tmp.0001.bam errors)
+    def tmp_setup = sort_bam ? """
+      mkdir -p samtools_sort_tmp
+      export TMPDIR="\$PWD/samtools_sort_tmp"
+    """ : ""
+
+    def tmp_args = sort_bam ? "-T samtools_sort_tmp/${prefix}.tmp -m ${sort_mem}" : ""
+
     """
-    INDEX=`find -L ./ -name "*.amb" | sed 's/\\.amb\$//'`
+    INDEX=\$(find -L ./ -name "*.amb" -print -quit | sed 's/\\.amb\$//')
+    if [[ -z "\$INDEX" ]]; then
+      echo "[ERROR] BWA index (.amb) not found in task directory" >&2
+      exit 1
+    fi
+
+    ${tmp_setup}
 
     bwa mem \\
-        $args \\
-        -t $task.cpus \\
-        \$INDEX \\
-        $reads \\
-        | samtools $samtools_command $args2 ${reference} --threads $task.cpus -o ${prefix}.${extension} -
+        ${args} \\
+        -t ${task.cpus} \\
+        "\$INDEX" \\
+        ${reads} \\
+      | samtools ${samtools_command} ${args2} ${reference} ${tmp_args} --threads ${task.cpus} -o ${prefix}.${extension} -
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
@@ -53,17 +71,17 @@ process BWA_MEM {
     """
 
     stub:
-    def args2 = task.ext.args2 ?: ''
-    def prefix = task.ext.prefix ?: "${meta.id}"
-    def extension = args2.contains("--output-fmt sam")   ? "sam" :
-                    args2.contains("--output-fmt cram")  ? "cram":
-                    sort_bam && args2.contains("-O cram")? "cram":
-                    !sort_bam && args2.contains("-C")    ? "cram":
-                    "bam"
+    def args2_stub = task.ext.args2 ?: ''
+    def prefix_stub = task.ext.prefix ?: "${meta.id}"
+    def extension_stub = args2_stub.contains("--output-fmt sam")   ? "sam" :
+                         args2_stub.contains("--output-fmt cram")  ? "cram":
+                         sort_bam && args2_stub.contains("-O cram")? "cram":
+                         !sort_bam && args2_stub.contains("-C")    ? "cram":
+                         "bam"
     """
-    touch ${prefix}.${extension}
-    touch ${prefix}.csi
-    touch ${prefix}.crai
+    touch ${prefix_stub}.${extension_stub}
+    touch ${prefix_stub}.csi
+    touch ${prefix_stub}.crai
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
