@@ -55,74 +55,107 @@ workflow GERMLINE {
     def ch_genome_bed = BUILD_INTERVALS.out.bed.map { meta, bed -> bed }
 
     // ------------------------------------------------------------------
-    // BAM strategy: reuse existing or align from FASTQ
+    // BAM strategy:
+    //   1. BAM samplesheet  → load paths from CSV directly (skip alignment)
+    //   2. Existing BAM dir → reuse precomputed BAMs from outdir/bam
+    //   3. FASTQ samplesheet → align + dedup
     // ------------------------------------------------------------------
-    def ss             = Utils.readSampleSheetInfo(params.input)
-    def sampleIds      = ss.sampleIds
-    def sample2patient = ss.sample2patient
-    def bamDir         = params.existing_bam_dir.toString()
-
-    def missingPairs     = Utils.findMissingBamBai(sampleIds, bamDir)
-    boolean useExisting  = false
-
-    if (params.use_existing_bams as boolean) {
-        if (missingPairs) {
-            def msg = "Missing BAM/BAI in ${bamDir} for: ${missingPairs.join(', ')}"
-            if (params.existing_bams_strict as boolean) error msg
-            log.warn "${msg} — falling back to FASTQ alignment."
-        } else {
-            useExisting = true
-            log.info "Reusing precomputed BAM/BAI from ${bamDir}."
-        }
-    }
+    def ssType = Utils.detectSampleSheetType(params.input)
 
     def ch_bam_final
     def ch_bai
     def ch_dup_metrics = null
     boolean run_picardlike = false
 
-    if (useExisting) {
-        // Load precomputed BAM/BAI
-        ch_bam_final = Channel.fromList(sampleIds).map { sid ->
-            def meta = [ id: sid, sample: sid, patient: sample2patient[sid] ]
-            tuple(meta, file("${bamDir}/${sid}.bam", checkIfExists: true))
-        }
-        ch_bai = Channel.fromList(sampleIds).map { sid ->
-            def meta = [ id: sid, sample: sid, patient: sample2patient[sid] ]
-            tuple(meta, file("${bamDir}/${sid}.bam.bai", checkIfExists: true))
-        }
+    if (ssType == 'bam') {
+        // ------------------------------------------------------------------
+        // BAM samplesheet: paths are declared in the CSV — skip alignment
+        // ------------------------------------------------------------------
+        log.info "BAM samplesheet detected — skipping alignment and deduplication."
 
-        def missingMetrics = Utils.findMissingMetrics(sampleIds, bamDir)
-        if (missingMetrics) {
-            log.warn "Missing *.metrics.txt for ${missingMetrics.size()} sample(s) — PICARDLIKE_DUPMETRICS skipped."
-        } else {
-            ch_dup_metrics = Channel.fromList(sampleIds).map { sid ->
-                def meta = [ id: sid, sample: sid, patient: sample2patient[sid] ]
-                tuple(meta, file("${bamDir}/${sid}.metrics.txt", checkIfExists: true))
-            }
-            run_picardlike = true
-        }
-
-    } else {
-        // Align from FASTQ
-        def ch_reads = Channel
+        def ch_ss = Channel
             .fromPath(params.input, checkIfExists: true)
             .splitCsv(header: true)
             .map { row ->
-                def sample = row.sample.toString()
-                def lane   = (row.lane ?: 'L1').toString()
-                def meta   = [ id: "${sample}_${lane}", sample: sample, patient: row.patient, lane: lane ]
-                tuple(meta, [ file(row.fastq_1), file(row.fastq_2) ])
+                def sample   = row.sample.toString()
+                def patient  = (row.patient ?: sample).toString()
+                def meta     = [ id: sample, sample: sample, patient: patient ]
+                def bam      = file(row.bam, checkIfExists: true)
+                def bai_path = row.bai ? row.bai.toString() : row.bam.toString() + '.bai'
+                def bai      = file(bai_path, checkIfExists: true)
+                tuple(meta, bam, bai)
+            }
+            .multiMap { meta, bam, bai ->
+                bams: tuple(meta, bam)
+                bais: tuple(meta, bai)
             }
 
-        ALIGN_AND_DEDUP(ch_reads, ch_index, ch_ref)
+        ch_bam_final = ch_ss.bams
+        ch_bai       = ch_ss.bais
 
-        ch_bam_final   = ALIGN_AND_DEDUP.out.bam
-        ch_dup_metrics = ALIGN_AND_DEDUP.out.metrics
-        run_picardlike = true
+    } else {
+        // ------------------------------------------------------------------
+        // FASTQ samplesheet: check for precomputed BAMs or align
+        // ------------------------------------------------------------------
+        def ss             = Utils.readSampleSheetInfo(params.input)
+        def sampleIds      = ss.sampleIds
+        def sample2patient = ss.sample2patient
+        def bamDir         = params.existing_bam_dir.toString()
 
-        // Extract BAI from bam_bai 3-tuple
-        ch_bai = ALIGN_AND_DEDUP.out.bam_bai.map { meta, bam, bai -> tuple(meta, bai) }
+        def missingPairs    = Utils.findMissingBamBai(sampleIds, bamDir)
+        boolean useExisting = false
+
+        if (params.use_existing_bams as boolean) {
+            if (missingPairs) {
+                def msg = "Missing BAM/BAI in ${bamDir} for: ${missingPairs.join(', ')}"
+                if (params.existing_bams_strict as boolean) error msg
+                log.warn "${msg} — falling back to FASTQ alignment."
+            } else {
+                useExisting = true
+                log.info "Reusing precomputed BAM/BAI from ${bamDir}."
+            }
+        }
+
+        if (useExisting) {
+            ch_bam_final = Channel.fromList(sampleIds).map { sid ->
+                def meta = [ id: sid, sample: sid, patient: sample2patient[sid] ]
+                tuple(meta, file("${bamDir}/${sid}.bam", checkIfExists: true))
+            }
+            ch_bai = Channel.fromList(sampleIds).map { sid ->
+                def meta = [ id: sid, sample: sid, patient: sample2patient[sid] ]
+                tuple(meta, file("${bamDir}/${sid}.bam.bai", checkIfExists: true))
+            }
+
+            def missingMetrics = Utils.findMissingMetrics(sampleIds, bamDir)
+            if (missingMetrics) {
+                log.warn "Missing *.metrics.txt for ${missingMetrics.size()} sample(s) — PICARDLIKE_DUPMETRICS skipped."
+            } else {
+                ch_dup_metrics = Channel.fromList(sampleIds).map { sid ->
+                    def meta = [ id: sid, sample: sid, patient: sample2patient[sid] ]
+                    tuple(meta, file("${bamDir}/${sid}.metrics.txt", checkIfExists: true))
+                }
+                run_picardlike = true
+            }
+
+        } else {
+            def ch_reads = Channel
+                .fromPath(params.input, checkIfExists: true)
+                .splitCsv(header: true)
+                .map { row ->
+                    def sample = row.sample.toString()
+                    def lane   = (row.lane ?: 'L1').toString()
+                    def meta   = [ id: "${sample}_${lane}", sample: sample, patient: row.patient, lane: lane ]
+                    tuple(meta, [ file(row.fastq_1), file(row.fastq_2) ])
+                }
+
+            ALIGN_AND_DEDUP(ch_reads, ch_index, ch_ref)
+
+            ch_bam_final   = ALIGN_AND_DEDUP.out.bam
+            ch_dup_metrics = ALIGN_AND_DEDUP.out.metrics
+            run_picardlike = true
+
+            ch_bai = ALIGN_AND_DEDUP.out.bam_bai.map { meta, bam, bai -> tuple(meta, bai) }
+        }
     }
 
     // Convert biobambam metrics to Picard-like format for MultiQC
@@ -159,7 +192,6 @@ workflow GERMLINE {
 
     BAM_QC(
         ch_bam_bai,
-        ch_bam_final,
         ch_qualimap_bed,
         ch_ref,
         ch_vbid_svd,

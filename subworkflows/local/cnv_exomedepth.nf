@@ -71,5 +71,7 @@ workflow CNV_EXOMEDEPTH {
 
             tuple(meta_cohort, samples, bams, bais, idxs, fasta, bed)
         }
-        | EXOMEDEPTH
+        .set { ch_exd_input }
+
+    EXOMEDEPTH(ch_exd_input, file("${projectDir}/modules/local/exomedepth/run_exomedepth.R"))
 }

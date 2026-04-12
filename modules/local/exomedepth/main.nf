@@ -8,6 +8,7 @@ process EXOMEDEPTH {
 
   input:
     tuple val(meta), val(samples), path(bams), path(bais), path(idxstats), path(fasta), path(bed)
+    path r_script
 
   output:
     path "${prefix}/calls/*.exomedepth.cnv.csv",      emit: calls
@@ -92,7 +93,7 @@ EOF
       [[ -e "bams/\${s}.bam.bai" ]] || { echo "Broken link: bams/\${s}.bam.bai" >&2; exit 1; }
     done
 
-    Rscript ${projectDir}/modules/local/exomedepth/run_exomedepth.R \\
+    Rscript ${r_script} \\
       --fasta ${fasta} \\
       --bed ${bed} \\
       --bed_coord ${bed_coord} \\
