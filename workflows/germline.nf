@@ -21,6 +21,8 @@ include { CNV_XHMM                    } from '../subworkflows/local/cnv_xhmm'
 include { VARIANT_CALLING             } from '../subworkflows/local/variant_calling'
 include { VARIANT_MERGE               } from '../subworkflows/local/variant_merge'
 include { PREPARE_BED as PREPARE_BED_QUALIMAP } from '../modules/local/prepare_bed'
+include { PAD_BED                            } from '../modules/local/pad_bed'
+include { SVDB_ANNOTATE                      } from '../subworkflows/local/svdb_annotate'
 
 workflow GERMLINE {
 
@@ -199,6 +201,13 @@ workflow GERMLINE {
     )
 
     // ------------------------------------------------------------------
+    // SVDB annotation input channels (populated by each enabled tool below)
+    // ------------------------------------------------------------------
+    def ch_svdb_manta = Channel.empty()
+    def ch_svdb_xhmm  = Channel.empty()
+    def ch_svdb_exd   = Channel.empty()
+
+    // ------------------------------------------------------------------
     // CNV: ExomeDepth (cohort-level)
     // ------------------------------------------------------------------
     if (params.exomedepth_enable) {
@@ -217,6 +226,12 @@ workflow GERMLINE {
             ch_ref_fasta_path,
             ch_ref_fai_path
         )
+        ch_svdb_exd = CNV_EXOMEDEPTH.out.calls
+            .flatten()
+            .map { csv ->
+                def sample = csv.name.replaceAll(/\.exomedepth\.cnv\.csv$/, '')
+                tuple([id: sample, sample: sample], csv)
+            }
     }
 
     // ------------------------------------------------------------------
@@ -268,6 +283,7 @@ workflow GERMLINE {
             Channel.value(file(params.xhmm_param_file)),
             ch_extreme_gc
         )
+        ch_svdb_xhmm = CNV_XHMM.out.xcnv
     }
 
     // ------------------------------------------------------------------
@@ -275,17 +291,19 @@ workflow GERMLINE {
     // ------------------------------------------------------------------
     if (params.deepvariant_enable || params.strelka_enable || params.manta_enable) {
 
-        def ch_var_bed_raw    = params.variant_target_bed ? Channel.value(file(params.variant_target_bed))
-                              : params.master_bed          ? Channel.value(file(params.master_bed))
-                              : ch_genome_bed
+        // Build +100 bp padded BED from the canonical target BED.
+        // Stored in resources/ via storeDir — skipped if already present.
+        def ch_canonical_bed = params.master_bed          ? Channel.value(file(params.master_bed))
+                             : params.coverage_target_bed ? Channel.value(file(params.coverage_target_bed))
+                             : ch_genome_bed
 
-        def ch_master_bed_raw = params.intervals   ? Channel.value(file(params.intervals))
-                              : ch_genome_bed
+        PAD_BED(ch_canonical_bed, ch_ref_fai_path)
+        def ch_padded_bed = PAD_BED.out.padded_bed
 
         VARIANT_CALLING(
             ch_bam_bai,
-            ch_var_bed_raw,
-            ch_master_bed_raw,
+            ch_padded_bed,
+            ch_padded_bed,
             ch_ref,
             ch_ref_fai,
             ch_ref_fasta_path,
@@ -295,6 +313,10 @@ workflow GERMLINE {
             Channel.value(file(params.manta_config))
         )
 
+        if (params.manta_enable) {
+            ch_svdb_manta = VARIANT_CALLING.out.manta_vcf
+        }
+
         // ------------------------------------------------------------------
         // VCF merging / normalisation
         // ------------------------------------------------------------------
@@ -303,5 +325,40 @@ workflow GERMLINE {
             VARIANT_CALLING.out.strelka_vcf,
             ch_ref
         )
+    }
+
+    // ------------------------------------------------------------------
+    // SVDB annotation (Manta SV, XHMM CNV, ExomeDepth CNV)
+    //
+    // Each input channel is built by mixing:
+    //   a) live outputs from this run  (populated above when tool is enabled)
+    //   b) Channel.fromPath scan of existing results/ (fallback when tool is
+    //      disabled but a previous run already produced the files)
+    //
+    // If neither source has data the arm is a silent no-op.
+    // ------------------------------------------------------------------
+    if (params.svdb_enable) {
+        def ch_m = ch_svdb_manta.mix(
+            params.manta_enable ? Channel.empty()
+            : Channel.fromPath("${params.outdir}/variants/manta/**/*.diploid_sv.vcf.gz", checkIfExists: false)
+                  .map { vcf -> tuple([id: vcf.parent.name, sample: vcf.parent.name], vcf) }
+        )
+
+        def ch_x = ch_svdb_xhmm.mix(
+            params.xhmm_enable ? Channel.empty()
+            : Channel.fromPath("${params.outdir}/cnv/xhmm/DATA.xcnv", checkIfExists: false)
+                  .map { xcnv -> tuple([id: 'DATA'], xcnv) }
+        )
+
+        def ch_e = ch_svdb_exd.mix(
+            params.exomedepth_enable ? Channel.empty()
+            : Channel.fromPath("${params.outdir}/cnv/exomedepth/**/calls/*.exomedepth.cnv.csv", checkIfExists: false)
+                  .map { csv ->
+                      def sample = csv.name.replaceAll(/\.exomedepth\.cnv\.csv$/, '')
+                      tuple([id: sample, sample: sample], csv)
+                  }
+        )
+
+        SVDB_ANNOTATE(ch_m, ch_x, ch_e)
     }
 }

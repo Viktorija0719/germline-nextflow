@@ -74,4 +74,7 @@ workflow CNV_EXOMEDEPTH {
         .set { ch_exd_input }
 
     EXOMEDEPTH(ch_exd_input, file("${projectDir}/modules/local/exomedepth/run_exomedepth.R"))
+
+    emit:
+    calls = EXOMEDEPTH.out.calls  // path glob: *.exomedepth.cnv.csv (one per sample)
 }

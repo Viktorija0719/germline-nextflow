@@ -46,6 +46,7 @@ workflow VARIANT_CALLING {
     main:
     ch_dv_vcf      = Channel.empty()
     ch_strelka_vcf = Channel.empty()
+    ch_manta_vcf   = Channel.empty()
 
     // ------------------------------------------------------------------
     // DeepVariant — scatter by interval chunks, then gather per sample
@@ -128,9 +129,11 @@ workflow VARIANT_CALLING {
             .map { meta, bam, bai, bedgz, bedtbi -> tuple(meta, [bam], bai, bedgz, bedtbi) }
 
         MANTA_GERMLINE(ch_manta_in, ch_ref, ch_ref_fai, ch_manta_config)
+        ch_manta_vcf = MANTA_GERMLINE.out.diploid_sv_vcf  // [meta, vcf.gz]
     }
 
     emit:
     dv_vcf      = ch_dv_vcf       // [meta, vcf.gz, tbi]  or empty
     strelka_vcf = ch_strelka_vcf  // [meta, vcf.gz, tbi]  or empty
+    manta_vcf   = ch_manta_vcf    // [meta, vcf.gz]        or empty
 }
