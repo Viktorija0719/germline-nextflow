@@ -4,8 +4,8 @@ process EXOMEDEPTH_CNV2VCF {
 
     conda "conda-forge::python>=3.8"
     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
-    'docker://python:3.11-slim' :
-    'docker.io/library/python:3.11-slim' }"
+    'docker://python:3.11' :
+    'docker.io/library/python:3.11' }"
 
     input:
     tuple val(meta), path(csv)

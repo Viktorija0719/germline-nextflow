@@ -26,14 +26,14 @@ def main():
     with open(csv_file) as fh, open(out_file, 'w') as out:
         out.write('\n'.join(vcf_header) + '\n')
         for row in csv.DictReader(fh):
-            chrom  = row['chromosome'].strip('"')
-            start  = int(row['start'].strip('"'))
-            end    = int(row['end'].strip('"'))
-            ctype  = row['type'].strip('"').lower()
+            chrom  = row['chromosome']
+            start  = int(row['start'])
+            end    = int(row['end'])
+            ctype  = row['type'].lower()
             svtype = 'DEL' if 'del' in ctype else 'DUP'
             svlen  = (end - start) if svtype == 'DUP' else -(end - start)
-            bf     = row['BF'].strip('"')
-            nexons = row['nexons'].strip('"')
+            bf     = row['BF']
+            nexons = row['nexons']
             info   = 'SVTYPE=%s;END=%d;SVLEN=%d;BF=%s;NEXONS=%s' % (svtype, end, svlen, bf, nexons)
             out.write('%s\t%d\t.\tN\t<%s>\t.\tPASS\t%s\n' % (chrom, start, svtype, info))
 
