@@ -8,16 +8,11 @@ process FILTER_COMMON_CNVS {
         'community.wave.seqera.io/library/bcftools_htslib:0a3fa2654b52006f' }"
 
     input:
-    tuple val(meta),
-          path(ed_vcf,   stageAs: 'ed_input.vcf'),
-          path(xhmm_vcf, stageAs: 'xhmm_input.vcf'),
-          path(manta_vcf, stageAs: 'manta_input.vcf')
+    tuple val(meta), path(vcf, stageAs: 'input.vcf')
 
     output:
-    tuple val(meta), path("${meta.id}.frq_filt_ed.vcf"),    emit: ed_vcf
-    tuple val(meta), path("${meta.id}.frq_filt_xhmm.vcf"),  emit: xhmm_vcf
-    tuple val(meta), path("${meta.id}.frq_filt_manta.vcf"), emit: manta_vcf
-    path "versions.yml", emit: versions
+    tuple val(meta), path("${prefix}.vcf"), emit: vcf
+    path "versions.yml",                   emit: versions
 
     when:
     task.ext.when == null || task.ext.when
@@ -25,25 +20,30 @@ process FILTER_COMMON_CNVS {
     script:
     def frq_threshold = task.ext.frq_threshold ?: '0.1'
     def svlen_max     = task.ext.svlen_max      ?: '1000000'
-    """
-    bcftools filter \\
-        -e 'INFO/FRQ>${frq_threshold}' \\
-        -o ${meta.id}.frq_filt_ed.vcf \\
-        ${ed_vcf}
+    prefix            = task.ext.prefix ?: "${meta.id}.frq_filt"
 
-    bcftools filter \\
-        -e 'INFO/FRQ>${frq_threshold}' \\
-        -o ${meta.id}.frq_filt_xhmm.vcf \\
-        ${xhmm_vcf}
+    if (task.ext.manta_filter)
+        """
+        bcftools view -f PASS input.vcf | \\
+            bcftools filter \\
+                -e 'INFO/FRQ>${frq_threshold} || INFO/SVLEN>${svlen_max} || INFO/SVLEN<-${svlen_max}' \\
+                -o ${prefix}.vcf
 
-    bcftools view -f PASS ${manta_vcf} | \\
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            bcftools: \$(bcftools --version 2>&1 | head -n1 | sed 's/^.*bcftools //; s/ .*\$//')
+        END_VERSIONS
+        """
+    else
+        """
         bcftools filter \\
-            -e 'INFO/FRQ>${frq_threshold} || INFO/SVLEN>${svlen_max} || INFO/SVLEN<-${svlen_max}' \\
-            -o ${meta.id}.frq_filt_manta.vcf
+            -e 'INFO/FRQ>${frq_threshold}' \\
+            -o ${prefix}.vcf \\
+            input.vcf
 
-    cat <<-END_VERSIONS > versions.yml
-    "${task.process}":
-        bcftools: \$(bcftools --version 2>&1 | head -n1 | sed 's/^.*bcftools //; s/ .*\$//')
-    END_VERSIONS
-    """
+        cat <<-END_VERSIONS > versions.yml
+        "${task.process}":
+            bcftools: \$(bcftools --version 2>&1 | head -n1 | sed 's/^.*bcftools //; s/ .*\$//')
+        END_VERSIONS
+        """
 }

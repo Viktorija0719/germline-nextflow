@@ -340,7 +340,7 @@ workflow GERMLINE {
     if (params.svdb_enable) {
         def ch_m = ch_svdb_manta.mix(
             params.manta_enable ? Channel.empty()
-            : Channel.fromPath("${params.outdir}/variants/manta/**/*.diploid_sv.vcf.gz", checkIfExists: false)
+            : Channel.fromPath("${params.outdir}/cnv/manta/**/*.diploid_sv.vcf.gz", checkIfExists: false)
                   .map { vcf -> tuple([id: vcf.parent.name, sample: vcf.parent.name], vcf) }
         )
 

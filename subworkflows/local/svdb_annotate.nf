@@ -22,7 +22,9 @@ include { SVDB_BUILD as SVDB_BUILD_ED    } from '../../modules/nf-core/svdb/buil
 include { SVDB_QUERY as SVDB_QUERY_MANTA } from '../../modules/nf-core/svdb/query'
 include { SVDB_QUERY as SVDB_QUERY_XHMM  } from '../../modules/nf-core/svdb/query'
 include { SVDB_QUERY as SVDB_QUERY_ED    } from '../../modules/nf-core/svdb/query'
-include { FILTER_COMMON_CNVS                  } from '../../modules/local/filter_common_cnvs'
+include { FILTER_COMMON_CNVS as FILTER_COMMON_CNVS_ED    } from '../../modules/local/filter_common_cnvs'
+include { FILTER_COMMON_CNVS as FILTER_COMMON_CNVS_XHMM  } from '../../modules/local/filter_common_cnvs'
+include { FILTER_COMMON_CNVS as FILTER_COMMON_CNVS_MANTA } from '../../modules/local/filter_common_cnvs'
 include { ANNOTSV as ANNOTSV_ED               } from '../../modules/local/annotsv'
 include { ANNOTSV as ANNOTSV_XHMM             } from '../../modules/local/annotsv'
 include { ANNOTSV as ANNOTSV_MANTA            } from '../../modules/local/annotsv'
@@ -134,17 +136,16 @@ workflow SVDB_ANNOTATE {
     def ch_final_manta = Channel.empty()
 
     if (params.frq_enable) {
-        def ch_filter_input = SVDB_QUERY_ED.out.vcf
-            .map { meta, vcf -> tuple(meta.id, meta, vcf) }
-            .join(SVDB_QUERY_XHMM.out.vcf.map  { meta, vcf -> tuple(meta.id, vcf) })
-            .join(SVDB_QUERY_MANTA.out.vcf.map { meta, vcf -> tuple(meta.id, vcf) })
-            .map { id, meta, ed_vcf, xhmm_vcf, manta_vcf -> tuple(meta, ed_vcf, xhmm_vcf, manta_vcf) }
+        // Each tool is filtered independently — a missing tool (e.g. XHMM when
+        // DepthOfCoverage fails) simply produces an empty channel for that arm
+        // without blocking annotation of the other tools.
+        FILTER_COMMON_CNVS_ED(SVDB_QUERY_ED.out.vcf)
+        FILTER_COMMON_CNVS_XHMM(SVDB_QUERY_XHMM.out.vcf)
+        FILTER_COMMON_CNVS_MANTA(SVDB_QUERY_MANTA.out.vcf)
 
-        FILTER_COMMON_CNVS(ch_filter_input)
-
-        ch_final_ed    = FILTER_COMMON_CNVS.out.ed_vcf
-        ch_final_xhmm  = FILTER_COMMON_CNVS.out.xhmm_vcf
-        ch_final_manta = FILTER_COMMON_CNVS.out.manta_vcf
+        ch_final_ed    = FILTER_COMMON_CNVS_ED.out.vcf
+        ch_final_xhmm  = FILTER_COMMON_CNVS_XHMM.out.vcf
+        ch_final_manta = FILTER_COMMON_CNVS_MANTA.out.vcf
     } else {
         ch_final_ed    = SVDB_QUERY_ED.out.vcf
         ch_final_xhmm  = SVDB_QUERY_XHMM.out.vcf
