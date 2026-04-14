@@ -30,7 +30,11 @@ process ANNOTSV {
     //   1. $ANNOTSV/etc/AnnotSV/configfile  (read-only in container)
     //   2. ~/.config/AnnotSV/configfile      (user config, writable — overrides system)
     // Copy the user's file to the writable user-config location.
-    def cfg_copy    = config_file    ? "mkdir -p ~/.config/AnnotSV && cp ${config_file} ~/.config/AnnotSV/configfile" : ''
+    def cfg_copy    = config_file    ? """if [ -e '${config_file}' ]; then
+        mkdir -p ~/.config/AnnotSV && cp '${config_file}' ~/.config/AnnotSV/configfile
+    else
+        echo '[WARN] AnnotSV config file not accessible in container; using defaults' >&2
+    fi""" : ''
     def annot_opt   = annotations_dir ? "-annotationsDir ${annotations_dir}" : ''
     def panels_opt  = panels_tsv     ? "-candidateGenesFile ${panels_tsv}"   : ''
     """

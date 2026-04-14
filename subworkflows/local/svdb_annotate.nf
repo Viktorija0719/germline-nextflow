@@ -168,10 +168,10 @@ workflow SVDB_ANNOTATE {
         }
         def ch_annotations = Channel.value(file(params.annotsv_annotations_dir, checkIfExists: true))
         def ch_config      = params.annotsv_config_file
-                             ? Channel.value(file(params.annotsv_config_file))
+                             ? Channel.value(file(params.annotsv_config_file, checkIfExists: true))
                              : Channel.value([])
         def ch_panels      = params.annotsv_panels_tsv
-                             ? Channel.value(file(params.annotsv_panels_tsv))
+                             ? Channel.value(file(params.annotsv_panels_tsv, checkIfExists: true))
                              : Channel.value([])
 
         ANNOTSV_ED(ch_final_ed,    ch_annotations, ch_config, ch_panels)
