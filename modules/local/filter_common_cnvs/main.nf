@@ -24,10 +24,17 @@ process FILTER_COMMON_CNVS {
 
     if (task.ext.manta_filter)
         """
-        bcftools view -f PASS input.vcf | \\
-            bcftools filter \\
-                -e 'INFO/FRQ>${frq_threshold} || INFO/SVLEN>${svlen_max} || INFO/SVLEN<-${svlen_max}' \\
-                -o ${prefix}.vcf
+        # Soft-tag: add FILTER flags but keep ALL variants.
+        # TooCommon  → cohort frequency exceeds threshold
+        # TooLarge   → SV length exceeds limit
+        bcftools filter \\
+            -e 'INFO/FRQ>${frq_threshold}' \\
+            -m + -s 'TooCommon' \\
+            input.vcf | \\
+        bcftools filter \\
+            -e 'INFO/SVLEN>${svlen_max} || INFO/SVLEN<-${svlen_max}' \\
+            -m + -s 'TooLarge' \\
+            -o ${prefix}.vcf
 
         cat <<-END_VERSIONS > versions.yml
         "${task.process}":
@@ -36,8 +43,10 @@ process FILTER_COMMON_CNVS {
         """
     else
         """
+        # Soft-tag common variants; all variants preserved with FILTER=TooCommon when FRQ exceeded.
         bcftools filter \\
             -e 'INFO/FRQ>${frq_threshold}' \\
+            -m + -s 'TooCommon' \\
             -o ${prefix}.vcf \\
             input.vcf
 

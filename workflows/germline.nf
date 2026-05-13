@@ -23,6 +23,8 @@ include { VARIANT_MERGE               } from '../subworkflows/local/variant_merg
 include { PREPARE_BED as PREPARE_BED_QUALIMAP } from '../modules/local/prepare_bed'
 include { PAD_BED                            } from '../modules/local/pad_bed'
 include { SVDB_ANNOTATE                      } from '../subworkflows/local/svdb_annotate'
+include { ROH_CALLER                         } from '../modules/local/roh_caller'
+include { SNV_ANNOTATE                       } from '../subworkflows/local/snv_annotate'
 
 workflow GERMLINE {
 
@@ -293,7 +295,8 @@ workflow GERMLINE {
 
         // Build +100 bp padded BED from the canonical target BED.
         // Stored in resources/ via storeDir — skipped if already present.
-        def ch_canonical_bed = params.master_bed          ? Channel.value(file(params.master_bed))
+        def ch_canonical_bed = params.variant_target_bed  ? Channel.value(file(params.variant_target_bed))
+                             : params.master_bed          ? Channel.value(file(params.master_bed))
                              : params.coverage_target_bed ? Channel.value(file(params.coverage_target_bed))
                              : ch_genome_bed
 
@@ -325,6 +328,24 @@ workflow GERMLINE {
             VARIANT_CALLING.out.strelka_vcf,
             ch_ref
         )
+
+        // ------------------------------------------------------------------
+        // ROH: runs on normalized DeepVariant-only VCF
+        // ------------------------------------------------------------------
+        if (params.roh_enable && params.deepvariant_enable && params.norm_dv_only_enable) {
+            ROH_CALLER(VARIANT_MERGE.out.norm_dv_only_vcf)
+        }
+
+        // ------------------------------------------------------------------
+        // SNV annotation: VEP → soft-tag SpliceAI35/MM → bcftools stats
+        // Uses combined DV+Strelka VCF when available, else DV-only.
+        // ------------------------------------------------------------------
+        if (params.vep_enable) {
+            def ch_snv_for_vep = (params.combine_dv_strelka_enable && params.norm_combined_enable)
+                ? VARIANT_MERGE.out.norm_combined_vcf
+                : VARIANT_MERGE.out.norm_dv_only_vcf
+            SNV_ANNOTATE(ch_snv_for_vep)
+        }
     }
 
     // ------------------------------------------------------------------
@@ -359,6 +380,6 @@ workflow GERMLINE {
                   }
         )
 
-        SVDB_ANNOTATE(ch_m, ch_x, ch_e)
+        SVDB_ANNOTATE(ch_m, ch_x, ch_e, ch_ref_fai_path)
     }
 }
