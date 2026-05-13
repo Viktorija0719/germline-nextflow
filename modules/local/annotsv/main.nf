@@ -41,16 +41,31 @@ process ANNOTSV {
     # Install custom config before running AnnotSV
     ${cfg_copy}
 
-    # AnnotSV requires a FORMAT + sample column in every VCF.
-    # ExomeDepth CNV2VCF outputs a minimal VCF without them; add dummies.
+    # AnnotSV skips variants whose FILTER is not '.' or 'PASS'.
+    # Reset all FILTER values to '.' so every variant is annotated,
+    # preserving the original filter info in a new INFO/ORIG_FILTER field.
+    # Also add dummy FORMAT+SAMPLE columns if absent (required by AnnotSV).
     input_vcf=${sv_vcf}
-    if ! grep -q "^#CHROM.*FORMAT" "${sv_vcf}"; then
-        awk 'BEGIN{OFS="\\t"}
-             /^##/    { print }
-             /^#CHROM/{ print \$0"\\tFORMAT\\tSAMPLE" }
-             !/^#/    { print \$0"\\tGT\\t./." }' "${sv_vcf}" > input_fixed.vcf
-        input_vcf=input_fixed.vcf
-    fi
+    awk 'BEGIN{OFS="\\t"}
+         /^##FILTER/ { print; next }
+         /^##INFO=<ID=ORIG_FILTER/ { next }
+         /^##/ { print; next }
+         /^#CHROM/ {
+             print "##INFO=<ID=ORIG_FILTER,Number=1,Type=String,Description=\\"Original FILTER value before AnnotSV pre-processing\\">"
+             if (\$0 !~ /FORMAT/) print \$0"\\tFORMAT\\tSAMPLE"
+             else print
+             next
+         }
+         {
+             orig = \$7
+             \$7 = "."
+             if (NF < 9) \$0 = \$0"\\tGT\\t./."
+             n = split(\$8, info_arr, ";")
+             \$8 = "ORIG_FILTER=" orig
+             for (i=1; i<=n; i++) \$8 = \$8 ";" info_arr[i]
+             print
+         }' "${sv_vcf}" > input_fixed.vcf
+    input_vcf=input_fixed.vcf
 
     AnnotSV \\
         ${annot_opt} \\
