@@ -7,9 +7,9 @@ process ANNOTSV {
         'https://depot.galaxyproject.org/singularity/annotsv:3.3.4--py311hdfd78af_1' :
         'quay.io/biocontainers/annotsv:3.3.4--py311hdfd78af_1' }"
 
-    // AnnotSV writes its user config to ~/.config/AnnotSV/ which maps to the
-    // real user home via Singularity autoMounts — writable-tmpfs is not needed
-    // and causes container startup failures on BeeGFS parallel filesystems.
+    // writable-tmpfs omitted: ~/.config/AnnotSV/ is on the user's home which
+    // Singularity autoMounts already mounts as writable. On BeeGFS nodes the
+    // overlay-tmpfs option causes container startup failures (exit 135).
 
     input:
     tuple val(meta), path(sv_vcf)
@@ -42,31 +42,16 @@ process ANNOTSV {
     # Install custom config before running AnnotSV
     ${cfg_copy}
 
-    # AnnotSV 3.x silently skips variants whose FILTER is not '.' or 'PASS'.
-    # Reset every FILTER to '.' so all variants (TooCommon, lowQC, …) are
-    # annotated, preserving the original value in INFO/ORIG_FILTER so it
-    # survives into the AnnotSV TSV and the knotAnnotSV Excel.
-    # Also add dummy FORMAT+SAMPLE columns when absent (required by AnnotSV).
-    awk 'BEGIN{OFS="\\t"}
-         /^##FILTER/              { print; next }
-         /^##INFO=<ID=ORIG_FILTER/ { next }
-         /^##/                    { print; next }
-         /^#CHROM/ {
-             print "##INFO=<ID=ORIG_FILTER,Number=1,Type=String,Description=\\"Original FILTER value before AnnotSV pre-processing\\">"
-             if (\$0 !~ /FORMAT/) print \$0"\\tFORMAT\\tSAMPLE"
-             else print
-             next
-         }
-         {
-             orig = \$7
-             \$7 = "."
-             if (NF < 9) \$0 = \$0"\\tGT\\t./."
-             n = split(\$8, info_arr, ";")
-             \$8 = "ORIG_FILTER=" orig
-             for (i=1; i<=n; i++) \$8 = \$8 ";" info_arr[i]
-             print
-         }' "${sv_vcf}" > input_fixed.vcf
-    input_vcf=input_fixed.vcf
+    # AnnotSV requires a FORMAT + sample column in every VCF.
+    # ExomeDepth CNV2VCF outputs a minimal VCF without them; add dummies.
+    input_vcf=${sv_vcf}
+    if ! grep -q "^#CHROM.*FORMAT" "${sv_vcf}"; then
+        awk 'BEGIN{OFS="\\t"}
+             /^##/    { print }
+             /^#CHROM/{ print \$0"\\tFORMAT\\tSAMPLE" }
+             !/^#/    { print \$0"\\tGT\\t./." }' "${sv_vcf}" > input_fixed.vcf
+        input_vcf=input_fixed.vcf
+    fi
 
     AnnotSV \\
         ${annot_opt} \\
