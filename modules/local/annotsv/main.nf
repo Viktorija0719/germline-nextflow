@@ -7,8 +7,9 @@ process ANNOTSV {
         'https://depot.galaxyproject.org/singularity/annotsv:3.3.4--py311hdfd78af_1' :
         'quay.io/biocontainers/annotsv:3.3.4--py311hdfd78af_1' }"
 
-    // Needed for Singularity: AnnotSV may write into its annotation directory
-    containerOptions "${ workflow.containerEngine == 'singularity' ? '--writable-tmpfs' : ''}"
+    // AnnotSV writes its user config to ~/.config/AnnotSV/ which maps to the
+    // real user home via Singularity autoMounts — writable-tmpfs is not needed
+    // and causes container startup failures on BeeGFS parallel filesystems.
 
     input:
     tuple val(meta), path(sv_vcf)
