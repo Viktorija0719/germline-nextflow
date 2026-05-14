@@ -31,7 +31,7 @@ process BEDTOOLS_MERGE_CNVS {
     for typ in dup del ins; do
         nvar=\$(grep -vc '^#' \${typ}.vcf 2>/dev/null || echo 0)
         if [ "\${nvar}" -gt 0 ]; then
-            bedtools merge -i \${typ}.vcf -c 8 -o collapse > \${typ}_collapsed.bed
+            bedtools merge -i \${typ}.vcf -c 6,8 -o first,collapse > \${typ}_collapsed.bed
         else
             touch \${typ}_collapsed.bed
         fi

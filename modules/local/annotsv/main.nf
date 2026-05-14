@@ -41,15 +41,15 @@ process ANNOTSV {
     # Install custom config before running AnnotSV
     ${cfg_copy}
 
-    # AnnotSV skips variants whose FILTER is not '.' or 'PASS'.
-    # Reset all FILTER values to '.' so every variant is annotated,
-    # preserving the original filter info in a new INFO/ORIG_FILTER field.
-    # Also add dummy FORMAT+SAMPLE columns if absent (required by AnnotSV).
-    input_vcf=${sv_vcf}
+    # AnnotSV 3.x silently skips variants whose FILTER is not '.' or 'PASS'.
+    # Reset every FILTER to '.' so all variants (TooCommon, lowQC, …) are
+    # annotated, preserving the original value in INFO/ORIG_FILTER so it
+    # survives into the AnnotSV TSV and the knotAnnotSV Excel.
+    # Also add dummy FORMAT+SAMPLE columns when absent (required by AnnotSV).
     awk 'BEGIN{OFS="\\t"}
-         /^##FILTER/ { print; next }
+         /^##FILTER/              { print; next }
          /^##INFO=<ID=ORIG_FILTER/ { next }
-         /^##/ { print; next }
+         /^##/                    { print; next }
          /^#CHROM/ {
              print "##INFO=<ID=ORIG_FILTER,Number=1,Type=String,Description=\\"Original FILTER value before AnnotSV pre-processing\\">"
              if (\$0 !~ /FORMAT/) print \$0"\\tFORMAT\\tSAMPLE"

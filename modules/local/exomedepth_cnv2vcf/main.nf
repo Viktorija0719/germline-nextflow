@@ -19,8 +19,9 @@ process EXOMEDEPTH_CNV2VCF {
     task.ext.when == null || task.ext.when
 
     script:
+    def args = task.ext.args ?: ''
     """
-    python3 ${py_script} ${csv} ${meta.id}
+    python3 ${py_script} ${csv} ${meta.id} ${args}
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
